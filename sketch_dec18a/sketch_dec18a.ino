@@ -161,8 +161,9 @@ bool checkCollision(int thresholdMm) {
 void setup() {
   Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, PATH_MAP_SERIAL_RX, PATH_MAP_SERIAL_TX);  // 初始化路径地图串口
+  mcpwm_init();         // 初始化电机控制模块
+  setSpeed(0,0);
   wy6005.begin(921600);
-  
   // 配置为单线输出模式：第4行，28点到46点
   bool configSuccess = wy6005.configSingleLineMode(LINE_NUM, START_POINT, END_POINT, true);
   #if DEBUG_ENABLE
@@ -178,7 +179,7 @@ void setup() {
   oledInit();
   timerInit();          // 初始化定时器
   keyInit();            // 初始化按键检测模块
-  mcpwm_init();         // 初始化电机控制模块
+
 }
 
 void loop() {

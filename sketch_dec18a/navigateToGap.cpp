@@ -709,7 +709,7 @@ bool planPathWithBFS() {
     // 平衡度分数：绝对值越小越好，表示两侧障碍物距离相等
     float balanceRaw = calculateObstacleBalanceScore(r, c);
     float balanceScore = abs(balanceRaw);
-    
+
     // 检查两侧是否都有障碍物（距离都不是最大值）
     int leftDist = 0, rightDist = 0;
     for (int c2 = c - 1; c2 >= 0; c2--) {
@@ -717,34 +717,34 @@ bool planPathWithBFS() {
       leftDist++;
     }
     if (leftDist == c) leftDist = COLS;
-    
+
     for (int c2 = c + 1; c2 < COLS; c2++) {
       if (pointCloudGrid[r][c2] != 0) break;
       rightDist++;
     }
     if (rightDist == COLS - c - 1) rightDist = COLS;
-    
+
     bool hasLeftObstacle = (leftDist < COLS);
     bool hasRightObstacle = (rightDist < COLS);
-    
+
     float centerOffset = abs(c - CENTER_COL);
-    float score;
-    
-    if (!hasLeftObstacle && !hasRightObstacle) {
-      // 两侧都没有障碍物：优先选择靠近中心列的点（保持直线）
-      // 大幅增加中心偏移权重，确保前面几行保持直线
-      score = r * 100.0f - centerOffset * 200.0f;
-    } else if (hasLeftObstacle && hasRightObstacle) {
-      // 两侧都有障碍物：优先选择平衡的点（走在中间）
-      score = r * 100.0f - balanceScore * 50.0f - centerOffset * 5.0f;
-    } else {
-      // 只有一侧有障碍物：优先选择远离障碍物且靠近中心列的点
-      score = r * 100.0f - balanceScore * 30.0f - centerOffset * 20.0f;
+
+    // 新评分：强烈优先保持直行（中心列附近），其次才是距离与左右平衡
+    // 这样可以避免为追求“最远”而拐弯走长路
+    float straightPenalty   = centerOffset * 500.0f;       // 偏离中心的惩罚（权重大）
+    float distanceReward    = r * 120.0f;                  // 行数越大越好，但权重低于直行
+    float balancePenalty    = balanceScore * 25.0f;        // 两侧不平衡的轻度惩罚
+    // 若两侧都有障碍物，平衡惩罚稍微降低，鼓励走在两障碍中间
+    if (hasLeftObstacle && hasRightObstacle) {
+      balancePenalty *= 0.7f;
     }
-    
-    // 记录分数更高的可达点（既远又走在障碍物中间）
-    // 当分数相等时，优先选择列偏移更小的点（更靠中间）
-    if (score > bestScore || (fabs(score - bestScore) < 0.001f && centerOffset < abs(bestC - CENTER_COL))) {
+
+    float score = distanceReward - straightPenalty - balancePenalty;
+
+    // 记录更优点；在分数接近时，优先选中心偏移更小的点
+    if (score > bestScore ||
+        (fabs(score - bestScore) < 1.0f && centerOffset < abs(bestC - CENTER_COL)) ||
+        (fabs(score - bestScore) < 1.0f && fabs(balanceScore) < fabs(calculateObstacleBalanceScore(bestR, bestC)))) {
       bestR = r;
       bestC = c;
       bestScore = score;
