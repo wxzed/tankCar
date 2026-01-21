@@ -729,19 +729,26 @@ bool planPathWithBFS() {
 
     float centerOffset = abs(c - CENTER_COL);
 
-    // 新评分：强烈优先保持直行（中心列附近），其次才是距离与左右平衡
-    // 这样可以避免为追求“最远”而拐弯走长路
-    float straightPenalty   = centerOffset * 500.0f;       // 偏离中心的惩罚（权重大）
-    float distanceReward    = r * 120.0f;                  // 行数越大越好，但权重低于直行
-    float balancePenalty    = balanceScore * 25.0f;        // 两侧不平衡的轻度惩罚
-    // 若两侧都有障碍物，平衡惩罚稍微降低，鼓励走在两障碍中间
+    // 自适应评分：近距离更偏好直行，远距离适当允许横向微调绕障
+    float straightWeight = (r < 8) ? 500.0f : 220.0f;      // 前几层强烈保持直线，后面降低
+    float straightPenalty   = centerOffset * straightWeight;
+    float distanceReward    = r * 120.0f;                  // 深度奖励
+    float balancePenalty    = balanceScore * 25.0f;        // 两侧不平衡的惩罚
     if (hasLeftObstacle && hasRightObstacle) {
-      balancePenalty *= 0.7f;
+      balancePenalty *= 0.7f;                              // 在两障碍之间时放宽平衡要求
     }
 
-    float score = distanceReward - straightPenalty - balancePenalty;
+    // 转向平滑：惩罚与父节点的列跳变，鼓励小角度微调
+    float turnPenalty = 0.0f;
+    int pr = parentR[r][c];
+    int pc = parentC[r][c];
+    if (pr >= 0 && pc >= 0) {
+      turnPenalty = abs(c - pc) * ((r < 8) ? 180.0f : 90.0f);
+    }
 
-    // 记录更优点；在分数接近时，优先选中心偏移更小的点
+    float score = distanceReward - straightPenalty - balancePenalty - turnPenalty;
+
+    // 记录更优点；分数接近时优先中心、更平衡
     if (score > bestScore ||
         (fabs(score - bestScore) < 1.0f && centerOffset < abs(bestC - CENTER_COL)) ||
         (fabs(score - bestScore) < 1.0f && fabs(balanceScore) < fabs(calculateObstacleBalanceScore(bestR, bestC)))) {
