@@ -177,6 +177,7 @@ bool loadNextWaypoint();    // 计算下一个航段的转角与距离
 void advanceWaypoint();     // 前进到下一个节点后更新当前位置
 bool checkAndBrakeForCollisionImmediate(); // 最新帧的紧急刹停
 bool tryReplanAndSwitchPath(bool stopImmediately); // 在行进阶段尝试重规划，支持平滑/急停切换
+void printPlannedStepsDebug(); // 打印规划出的动作序列（供调试串口查看）
 
 /*
  * 调试：打印当前帧 zValues 的统计信息和部分列值
@@ -304,6 +305,8 @@ void runGapTest()  {
 
   // 每次规划成功都输出地图到专用串口
   printPathMap();
+  // 调试：输出分解后的动作序列（转向/直行）
+  printPlannedStepsDebug();
   
   // 【测试模式】不执行真实动作
   // navigateToGap();
@@ -968,6 +971,117 @@ bool tryReplanAndSwitchPath(bool stopImmediately) {
   Serial.println("【动态重规划】刷新路径地图 -> Serial/Serial2");
   printPathMap();
   return true;
+}
+
+/*
+ * 调试：打印规划出的动作序列（基于航点列表）
+ * 输出格式：左/右转 X 度，直行 Y cm
+ */
+void printPlannedStepsDebug() {
+  if (!pathAvailable || waypointCount < 2) {
+    Serial.println("【规划动作序列】无可执行路径");
+    return;
+  }
+
+  Serial.println("【规划动作序列】(基于航点)");
+
+  int curR = waypointRows[0];
+  int curC = waypointCols[0];
+  float curHeading = 0.0f; // 初始朝向正前方
+  int step = 1;
+
+  int i = 1;
+  while (i < waypointCount) {
+    int nr = waypointRows[i];
+    int nc = waypointCols[i];
+    int dr = nr - curR;
+    int dc = nc - curC;
+    int adr = abs(dr);
+    int adc = abs(dc);
+
+    // 1) 纯前进：合并连续直行
+    if (adr == 1 && adc == 0) {
+      int straightCount = 1;
+      while ((i + straightCount) < waypointCount) {
+        int pr = waypointRows[i + straightCount - 1];
+        int pc = waypointCols[i + straightCount - 1];
+        int nr2 = waypointRows[i + straightCount];
+        int nc2 = waypointCols[i + straightCount];
+        if (nc2 != pc) break;
+        if ((nr2 - pr) != dr) break;
+        straightCount++;
+      }
+      float distCm = straightCount * LAYER_HEIGHT;
+      Serial.printf("  步骤%d: 直行 %.1f cm\n", step++, distCm);
+      curR = waypointRows[i + straightCount - 1];
+      curC = waypointCols[i + straightCount - 1];
+      i += straightCount;
+      continue;
+    }
+
+    // 2) 斜向侧移：合并同方向连续侧移
+    if (adr == 1 && adc == 1) {
+      int lateralSign = (dc > 0) ? 1 : -1; // 右为正，左为负
+      int diagCount = 1;
+      while ((i + diagCount) < waypointCount) {
+        int pr = waypointRows[i + diagCount - 1];
+        int pc = waypointCols[i + diagCount - 1];
+        int nr2 = waypointRows[i + diagCount];
+        int nc2 = waypointCols[i + diagCount];
+        int dr2 = nr2 - pr;
+        int dc2 = nc2 - pc;
+        if (abs(dr2) != 1 || abs(dc2) != 1) break;
+        int sign2 = (dc2 > 0) ? 1 : -1;
+        if (sign2 != lateralSign) break;
+        diagCount++;
+      }
+
+      float sideTurn = -lateralSign * ANGLE_STEP; // 侧移时的偏转角
+      float distCm = diagCount * LAYER_HEIGHT * 1.41421356f;
+      Serial.printf("  步骤%d: %s转 %.1f 度\n", step++,
+                    (sideTurn < 0) ? "左" : "右", fabs(sideTurn));
+      Serial.printf("  步骤%d: 直行 %.1f cm\n", step++, distCm);
+      Serial.printf("  步骤%d: %s转 %.1f 度 (侧移后回正)\n", step++,
+                    (sideTurn > 0) ? "左" : "右", fabs(sideTurn));
+
+      curHeading = 0.0f;
+      curR = waypointRows[i + diagCount - 1];
+      curC = waypointCols[i + diagCount - 1];
+      i += diagCount;
+      continue;
+    }
+
+    // 3) 其他不常见情况，逐步输出
+    float targetHeading = -(nc - CENTER_COL) * ANGLE_STEP;
+    float turnDeg = targetHeading - curHeading;
+    while (turnDeg > 180.0f) turnDeg -= 360.0f;
+    while (turnDeg < -180.0f) turnDeg += 360.0f;
+    if (fabs(turnDeg) > 0.5f) {
+      Serial.printf("  步骤%d: %s转 %.1f 度\n", step++,
+                    (turnDeg < 0) ? "左" : "右", fabs(turnDeg));
+      curHeading = targetHeading;
+    }
+    float distCm = sqrtf((float)(adr * adr + adc * adc)) * LAYER_HEIGHT;
+    Serial.printf("  步骤%d: 直行 %.1f cm\n", step++, distCm);
+    curR = nr;
+    curC = nc;
+    i++;
+  }
+
+  // 终点默认不再强制“回正”，避免出现成对的 ±X° 输出
+  // 如需回正，可放开下列代码：
+  // if (fabs(curHeading) > 0.5f) {
+  //   float backTurn = -curHeading;
+  //   while (backTurn > 180.0f) backTurn -= 360.0f;
+  //   while (backTurn < -180.0f) backTurn += 360.0f;
+  //   Serial.printf("  步骤%d: %s转 %.1f 度 (终点回正)\n",
+  //                 step++,
+  //                 (backTurn < 0) ? "左" : "右",
+  //                 fabs(backTurn));
+  // }
+
+  Serial.printf("  终点: 行%d 列%d, 航段数:%d\n",
+                goalRow + 1, goalCol, waypointCount - 1);
 }
 
 /*
