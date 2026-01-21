@@ -8,13 +8,17 @@
 #include "sensordata.h"
 #include "motor.h"
 #include "navigateToGap.h"
+#include <string.h>
 #define SDA_PIN 1
 #define SCL_PIN 2
 #define OLED_ADDR 0x3C
 #define DEBUG_ENABLE 0  
+#define PATH_MAP_SERIAL_RX 4  // IO4作为路径地图串口的RX
+#define PATH_MAP_SERIAL_TX 5  // IO5作为路径地图串口的TX
 
 Adafruit_SSD1306   display(128, 64, &Wire, -1);
 DFRobot_WY6005     wy6005(&Serial1, 1000, SERIAL_8N1, 40, 41);
+// Serial2已经在ESP32核心库中预定义，无需再次定义
 esp_timer_handle_t periodic_timer;
 void IRAM_ATTR onTimer(void* arg) {
   static uint32_t timer_count = 0;
@@ -71,29 +75,75 @@ void updateDisplay()
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   
-  display.print("Move: ");
-  switch(currentMoveType) {
-    case MOVE_STOP:       display.println("STOP"); break;
-    case MOVE_STRAIGHT:   display.println("STRAIGHT"); break;
-    case MOVE_TURN_LEFT:  display.println("LEFT"); break;
-    case MOVE_TURN_RIGHT: display.println("RIGHT"); break;
-    default:              display.println("UNKNOWN"); break;
+  // 检查是否在搜索模式
+  NavigationState navState = getNavigationState();
+  if (navState == NAV_SEARCHING) {
+    // 搜索模式：显示搜索原因
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.print("Search:");
+    display.setCursor(0, 20);
+    
+    SearchReason reason = getSearchReason();
+    switch(reason) {
+      case SEARCH_NO_GAP:
+        display.print("S:1");
+        display.setTextSize(1);
+        display.setCursor(0, 45);
+        display.print("No Gap");
+        break;
+      case SEARCH_COLLISION:
+        display.print("S:2");
+        display.setTextSize(1);
+        display.setCursor(0, 45);
+        display.print("Obstacle");
+        break;
+      default:
+        display.print("S:0");
+        display.setTextSize(1);
+        display.setCursor(0, 45);
+        display.print("Searching");
+        break;
+    }
+  } else {
+    // 正常模式：显示下一步执行步骤
+    char step1[10] = "", step2[10] = "", step3[10] = "";
+    float value1 = 0.0, value2 = 0.0, value3 = 0.0;
+    
+    getNextStepInfo(step1, &value1, step2, &value2, step3, &value3);
+    
+    // 显示步骤1
+    if (strlen(step1) > 0) {
+      display.print(step1);
+      display.print(":");
+      display.print((int)value1);
+      if (strlen(step2) > 0 || strlen(step3) > 0) {
+        display.print(",");
+      }
+    }
+    
+    // 显示步骤2
+    if (strlen(step2) > 0) {
+      display.print(step2);
+      display.print(":");
+      display.print((int)value2);
+      if (strlen(step3) > 0) {
+        display.print(",");
+      }
+    }
+    
+    // 显示步骤3
+    if (strlen(step3) > 0) {
+      display.print(step3);
+      display.print(":");
+      display.print((int)value3);
+    }
+    
+    // 如果没有步骤信息，显示状态
+    if (strlen(step1) == 0 && strlen(step2) == 0 && strlen(step3) == 0) {
+      display.print("IDLE");
+    }
   }
-  
-  display.print("Turn: ");
-  switch(turnState) {
-    case TURN_STRAIGHT:   display.println("STRAIGHT"); break;
-    case TURN_TURNING:    display.println("TURNING"); break;
-    case TUNR_TURNBACK:   display.println("TURNBACK"); break;
-    case TURN_WAIT:       display.println("WAIT"); break;
-    case TURN_STOPING:    display.println("STOPING"); break;
-    case TURN_LEAVE_HOLE: display.println("LEAVE"); break;
-    case TURN_RETREAT:    display.println("RETREAT"); break;
-    default:              display.println("UNKNOWN"); break;
-  }
-  
-  display.print("Angle: ");
-  display.println(angleDeg);
   
   display.display();
 }
@@ -110,6 +160,7 @@ bool checkCollision(int thresholdMm) {
 
 void setup() {
   Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, PATH_MAP_SERIAL_RX, PATH_MAP_SERIAL_TX);  // 初始化路径地图串口
   wy6005.begin(921600);
   
   // 配置为单线输出模式：第4行，28点到46点

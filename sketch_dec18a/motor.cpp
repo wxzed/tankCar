@@ -146,7 +146,7 @@ void moveDistance(float distanceCm)
       if (elapsed >= moveDurationMs)
       {
           isMoving = false;
-          setSpeed(0, 0); // 停车
+          setSpeed(0, 0); // 停车              
 
           // 只在动作完成时打印一次关键动作信息
           if (lastDistanceCm > 0)
@@ -223,7 +223,7 @@ void turnAngle(float angleDeg)
               Serial.print(" ms / 目标 ");
               Serial.print(turnDurationMs);
               Serial.println(" ms");
-          }
       }
   }
+}
 }

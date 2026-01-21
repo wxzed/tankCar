@@ -7,7 +7,7 @@
 // 配置单线模式参数
 #define LINE_NUM        4        // 第5行
 #define START_POINT     16       // 起始点16
-#define END_POINT       48       // 结束点48 
+#define END_POINT       47       // 结束点48 
 #define TOTAL_POINTS    (END_POINT - START_POINT + 1)  // 总点数
 #define FILTER_SAMPLES  3        // 采集3次
 #define ROW_INTERVAL_CM 5        // 行间隔，每行代表的实际距离增量 单位 cm
