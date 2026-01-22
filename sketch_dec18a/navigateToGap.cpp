@@ -171,6 +171,7 @@ bool checkCollisionRisk(int thresholdMm, int startCol, int endCol); // 前向声
 bool checkPathWidth(int row, int centerCol, float distance); // 前向声明，供BFS使用
 void calculateCarWidthColumns(float distance, int centerCol, int& startCol, int& endCol); // 前向声明，供BFS标记宽度
 float calculateObstacleBalanceScore(int row, int col); // 计算当前点两侧障碍物的平衡分数（越接近0越好，表示两侧障碍物距离相等）
+int calculateCorridorWidth(int row, int col); // 计算当前位置通道宽度（越大越宽）
 bool planPathWithBFS();     // 基于BFS的路径规划
 void markPathOnMap(int parentRow[ROWS][COLS], int parentCol[ROWS][COLS], int endR, int endC);
 bool loadNextWaypoint();    // 计算下一个航段的转角与距离
@@ -733,28 +734,92 @@ bool planPathWithBFS() {
     float centerOffset = abs(c - CENTER_COL);
 
     // 自适应评分：近距离更偏好直行，远距离适当允许横向微调绕障
-    float straightWeight = (r < 8) ? 500.0f : 220.0f;      // 前几层强烈保持直线，后面降低
-    float straightPenalty   = centerOffset * straightWeight;
-    float distanceReward    = r * 120.0f;                  // 深度奖励
-    float balancePenalty    = balanceScore * 25.0f;        // 两侧不平衡的惩罚
+    float straightWeight = 220.0f;                         // 不再按前8行区分
+    float distanceReward    = r * 210.0f;                  // 深度奖励（更高权重）
+    float balancePenalty    = balanceScore * 16.0f;
     if (hasLeftObstacle && hasRightObstacle) {
       balancePenalty *= 0.7f;                              // 在两障碍之间时放宽平衡要求
     }
+
+    // 当一侧空间明显更大时，鼓励提前朝开阔侧偏移，避免被迫向狭窄侧绕行
+    int sideDiff = leftDist - rightDist;                   // 正值=左侧更开阔，负值=右侧更开阔
+    float sideBias = 0.0f;
+    if (abs(sideDiff) >= 2) {
+      // 放宽“贴中线”惩罚，允许更早偏向开阔侧
+      straightWeight *= 0.5f;
+      // 朝开阔侧移动时给予奖励（限制奖励幅度，避免贴边）
+      int towardOpen = (sideDiff > 0) ? (int)round(CENTER_COL - c) : (int)round(c - CENTER_COL);
+      if (towardOpen > 0) {
+        int cappedCols = min(towardOpen, 8);               // 最多奖励偏移8列
+        sideBias = cappedCols * 160.0f;
+      }
+      // 单侧开阔时不必强制平衡
+      if (!hasLeftObstacle || !hasRightObstacle) {
+        balancePenalty *= 0.4f;
+      }
+    }
+
+    float straightPenalty   = centerOffset * straightWeight;
 
     // 转向平滑：惩罚与父节点的列跳变，鼓励小角度微调
     float turnPenalty = 0.0f;
     int pr = parentR[r][c];
     int pc = parentC[r][c];
     if (pr >= 0 && pc >= 0) {
-      turnPenalty = abs(c - pc) * ((r < 8) ? 180.0f : 90.0f);
+      // 统一转向惩罚，避免前8行“强限制”
+      turnPenalty = abs(c - pc) * 140.0f;
     }
 
-    float score = distanceReward - straightPenalty - balancePenalty - turnPenalty;
+    // 前向可达性：看未来若干行在当前列是否还能直走
+    // 若前方很快被堵，鼓励提前侧移
+    int forwardClearRows = 0;
+    const int LOOKAHEAD_ROWS = 5;
+    for (int step = 1; step <= LOOKAHEAD_ROWS; step++) {
+      int rr = r + step;
+      if (rr >= ROWS) break;
+      float distCm = (rr + 1) * LAYER_HEIGHT;
+      if (!checkPathWidth(rr, c, distCm)) break;
+      forwardClearRows++;
+    }
+    float forwardClearReward = forwardClearRows * 90.0f;
+    float forwardBlockPenalty = (forwardClearRows == 0) ? 180.0f : 0.0f;
+
+    // 通道宽度偏好：满足车身宽度前提下，越宽越好，但深度权重更高
+    int corridorWidth = leftDist + rightDist + 1;
+    if (leftDist >= COLS || rightDist >= COLS) {
+      corridorWidth = COLS * 2; // 一侧无遮挡时，视为非常宽
+    }
+    const int minPassCols = 6; // 车宽4列 + 左右安全边距1列
+    int effectiveWidth = min(corridorWidth, COLS * 2);
+    float corridorReward = 0.0f;
+    if (effectiveWidth >= minPassCols) {
+      // 仅在满足车身宽度时给宽度奖励
+      corridorReward = (effectiveWidth - minPassCols) * 18.0f;
+    }
+
+    float score = distanceReward - straightPenalty - balancePenalty - turnPenalty
+                  + sideBias + corridorReward + forwardClearReward - forwardBlockPenalty;
 
     // 记录更优点；分数接近时优先中心、更平衡
-    if (score > bestScore ||
-        (fabs(score - bestScore) < 1.0f && centerOffset < abs(bestC - CENTER_COL)) ||
-        (fabs(score - bestScore) < 1.0f && fabs(balanceScore) < fabs(calculateObstacleBalanceScore(bestR, bestC)))) {
+    int bestCorridorWidth = calculateCorridorWidth(bestR, bestC);
+    bool shouldUpdate = false;
+    if (r > bestR) {
+      // 深度优先：能走更深就直接选择
+      shouldUpdate = true;
+    } else if (r == bestR) {
+      if (score > bestScore) {
+        shouldUpdate = true;
+      } else if (fabs(score - bestScore) < 1.0f && corridorWidth > bestCorridorWidth) {
+        shouldUpdate = true;
+      } else if (fabs(score - bestScore) < 1.0f && centerOffset < abs(bestC - CENTER_COL)) {
+        shouldUpdate = true;
+      } else if (fabs(score - bestScore) < 1.0f &&
+                 fabs(balanceScore) < fabs(calculateObstacleBalanceScore(bestR, bestC))) {
+        shouldUpdate = true;
+      }
+    }
+
+    if (shouldUpdate) {
       bestR = r;
       bestC = c;
       bestScore = score;
@@ -991,6 +1056,7 @@ void printPlannedStepsDebug() {
   int step = 1;
 
   int i = 1;
+  bool nonForwardWarningPrinted = false;
   while (i < waypointCount) {
     int nr = waypointRows[i];
     int nc = waypointCols[i];
@@ -998,6 +1064,18 @@ void printPlannedStepsDebug() {
     int dc = nc - curC;
     int adr = abs(dr);
     int adc = abs(dc);
+
+    // 仅用于调试输出：若出现后退/纯横移节点，打印提示并跳过
+    if (dr <= 0) {
+      if (!nonForwardWarningPrinted) {
+        Serial.println("  【注意】路径含后退/横移节点，动作序列已跳过这些节点");
+        nonForwardWarningPrinted = true;
+      }
+      curR = nr;
+      curC = nc;
+      i++;
+      continue;
+    }
 
     // 1) 纯前进：合并连续直行
     if (adr == 1 && adc == 0) {
@@ -1021,7 +1099,7 @@ void printPlannedStepsDebug() {
 
     // 2) 斜向侧移：合并同方向连续侧移
     if (adr == 1 && adc == 1) {
-      int lateralSign = (dc > 0) ? 1 : -1; // 右为正，左为负
+      int lateralSign = (dc > 0) ? 1 : -1;
       int diagCount = 1;
       while ((i + diagCount) < waypointCount) {
         int pr = waypointRows[i + diagCount - 1];
@@ -1036,13 +1114,16 @@ void printPlannedStepsDebug() {
         diagCount++;
       }
 
-      float sideTurn = -lateralSign * ANGLE_STEP; // 侧移时的偏转角
+      float sideTurn = -dc * ANGLE_STEP; // 与转向逻辑保持一致：列>中心为左转(负角)
       float distCm = diagCount * LAYER_HEIGHT * 1.41421356f;
       Serial.printf("  步骤%d: %s转 %.1f 度\n", step++,
                     (sideTurn < 0) ? "左" : "右", fabs(sideTurn));
       Serial.printf("  步骤%d: 直行 %.1f cm\n", step++, distCm);
-      Serial.printf("  步骤%d: %s转 %.1f 度 (侧移后回正)\n", step++,
-                    (sideTurn > 0) ? "左" : "右", fabs(sideTurn));
+      // 侧移后回正：只有在确实发生了前进时才输出
+      if (distCm > 0.5f) {
+        Serial.printf("  步骤%d: %s转 %.1f 度 (侧移后回正)\n", step++,
+                      (sideTurn > 0) ? "左" : "右", fabs(sideTurn));
+      }
 
       curHeading = 0.0f;
       curR = waypointRows[i + diagCount - 1];
@@ -1116,11 +1197,29 @@ void calculatePosition(float distance, float angle, int& row, int& col) {
  * 返回：通过引用返回起始列和结束列
  */
 void calculateCarWidthColumns(float distance, int centerCol, int& startCol, int& endCol) {
-  // 统一使用5列宽度：中心列左右各2列
-  const int HALF_COLS = 2;  // 每边2列，总共5列（中心列+左右各2列）
-  
-  startCol = centerCol - HALF_COLS;
-  endCol = centerCol + HALF_COLS;
+  // 使用4列宽度：中心列左右各1列，再根据空隙情况额外扩展1列
+  // 总宽度=4列，更贴近实际车宽
+  const int BASE_HALF = 1;  // 先取中心列左右各1列（共3列）
+  int row = (int)(distance / LAYER_HEIGHT) - 1;
+  if (row < 0) row = 0;
+  if (row >= ROWS) row = ROWS - 1;
+
+  int leftSpace = 0;
+  for (int c = centerCol - 1; c >= 0; c--) {
+    if (pointCloudGrid[row][c] != 0) break;
+    leftSpace++;
+  }
+  int rightSpace = 0;
+  for (int c = centerCol + 1; c < COLS; c++) {
+    if (pointCloudGrid[row][c] != 0) break;
+    rightSpace++;
+  }
+
+  int extraRight = (rightSpace >= leftSpace) ? 1 : 0;
+  int extraLeft = 1 - extraRight;
+
+  startCol = centerCol - BASE_HALF - extraLeft;
+  endCol = centerCol + BASE_HALF + extraRight;
   
   // 限制在有效范围内
   if (startCol < 0) startCol = 0;
@@ -1211,6 +1310,40 @@ float calculateObstacleBalanceScore(int row, int col) {
   
   // 返回平衡分数：左右距离差（绝对值越小越好）
   return (float)(rightDist - leftDist);
+}
+
+/*
+ * 计算当前位置的通道宽度（左右到障碍物的距离之和）
+ * 返回值越大表示通道越宽
+ */
+int calculateCorridorWidth(int row, int col) {
+  if (row < 0 || row >= ROWS || col < 0 || col >= COLS) {
+    return 0;
+  }
+
+  int leftDist = 0;
+  for (int c = col - 1; c >= 0; c--) {
+    if (pointCloudGrid[row][c] != 0) {
+      break;
+    }
+    leftDist++;
+  }
+  if (leftDist == col) {
+    leftDist = COLS;  // 左侧无遮挡
+  }
+
+  int rightDist = 0;
+  for (int c = col + 1; c < COLS; c++) {
+    if (pointCloudGrid[row][c] != 0) {
+      break;
+    }
+    rightDist++;
+  }
+  if (rightDist == COLS - col - 1) {
+    rightDist = COLS;  // 右侧无遮挡
+  }
+
+  return leftDist + rightDist + 1;
 }
 
 /*
