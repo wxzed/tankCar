@@ -7,8 +7,10 @@
 #define RIGHT_MOTOR_EN_PIN  14      // 右电机EN引脚
 #define RIGHT_MOTOR_DIR_PIN 21     // 右电机方向引脚
 
-#define CAR_SPEED_CM_PER_SEC 22.0f 
-#define CAR_TURN_DEG_PER_SEC 108.4f 
+// 实测校准（目标->实际）：36cm->32cm, 20°->15°
+// 时间法控制：实际偏小 => 降低速度/角速度常量以拉长时间
+#define CAR_SPEED_CM_PER_SEC 19.6f 
+#define CAR_TURN_DEG_PER_SEC 81.3f 
 
 #define LEFT_SPEED  60
 #define RIGHT_SPEED 60

@@ -25,6 +25,11 @@ SearchReason getSearchReason();  // 获取当前搜索原因
 
 // 获取下一步执行步骤信息（用于屏幕显示）
 void getNextStepInfo(char* step1, float* value1, char* step2, float* value2, char* step3, float* value3);
+// 获取完整计划步骤（用于测试模式显示）
+int getPlannedStepsForDisplay(char steps[][10], float values[], int maxSteps);
+// 步进暂停控制（电机启用时每步执行完暂停，按键继续）
+bool isStepPauseActive();
+void resumeStepPause();
 
 // 打印当前点云地图（搜索模式下使用）
 void printCurrentMap();

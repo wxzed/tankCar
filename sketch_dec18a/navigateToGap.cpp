@@ -8,7 +8,9 @@
  */
 #include "navigateToGap.h"
 #include "sensordata.h"
+#include "tantable.h"
 #include "motor.h"
+#include "key.h"
 #include <Arduino.h>
 #include <Adafruit_SSD1306.h>
 
@@ -66,6 +68,7 @@ float navTurnBackAngle = 0.0;
 static NavigationState lastLoggedNavState = NAV_IDLE; // 调试：记录上一次打印的状态
 static bool moveToEntranceStarted = false; // 标记是否已经启动了前进到入口的动作
 static bool pathCompleted = false; // 标记路径是否刚完成，需要在重新检测前延时
+static const unsigned long REPLAN_DELAY_MS = 200; // 重新规划前的短暂停顿
 
 // 路径规划结果
 static bool pathAvailable = false;
@@ -81,6 +84,24 @@ static int waypointCount = 0;
 static int waypointIndex = 0;
 static int currentPoseRow = 0;
 static int currentPoseCol = (int)round(CENTER_COL);
+static int executedSegments = 0;           // 每帧最多执行的航段数计数
+static float lastSegmentTurnAngle = 0.0f;  // 最近航段的转向角
+static bool pendingReplanLog = false;
+static const char* pendingReplanReason = "";
+static bool pendingBackThenStraight = false; // 回正后是否再执行一次直行
+static bool macroPlanValid = false;
+static bool macroActive = false;
+static int macroPhase = 0; // 0=直行1,1=转向,2=直行2,3=回正,4=直行3
+static bool stepPauseActive = false; // 步进暂停：每步完成后等待按键继续
+static float macroStraight1Cm = 0.0f;
+static float macroDiagDistCm = 0.0f;
+static float macroStraight3Cm = 0.0f;
+static float macroTurnDeg = 0.0f;
+static int macroDiagRows = 0;
+static const bool REPLAN_AFTER_TURNBACK = true; // 回正后立即重规划，不再执行最后直行
+static char currentAction[10] = ""; // 当前执行动作：left/right/line
+static float currentActionValue = 0.0f;
+static const unsigned long ACTION_STEP_DELAY_MS = 250; // 每步完成后停顿，便于观察
 
 // 搜索模式相关变量
 static int searchStep = 0;  // 搜索步骤：0=旋转, 1=检测, 2=旋转, 3=检测...
@@ -128,29 +149,109 @@ void getNextStepInfo(char* step1, float* value1, char* step2, float* value2, cha
     return;
   }
   
-  // 根据当前状态和下一步状态显示步骤（基于当前航段）
+  // 只显示当前正在执行的一步
+  if (state == NAV_TURN_TO_GAP || state == NAV_MOVE_TO_ENTRANCE || state == NAV_TURN_BACK) {
+    if (strlen(currentAction) > 0) {
+      strcpy(step1, currentAction);
+      *value1 = currentActionValue;
+      return;
+    }
+  }
   if (state == NAV_TURN_TO_GAP) {
     if (abs(navTurnAngle) > 0.5f) {
       strcpy(step1, navTurnAngle < 0 ? "left" : "right");
       *value1 = abs(navTurnAngle);
     }
-    strcpy(step2, "line");
-    *value2 = navForwardDist;
+    return;
   } else if (state == NAV_MOVE_TO_ENTRANCE) {
     strcpy(step1, "line");
     *value1 = navForwardDist;
+    return;
+  } else if (state == NAV_TURN_BACK) {
+    if (abs(navTurnBackAngle) > 0.5f) {
+      strcpy(step1, navTurnBackAngle < 0 ? "left" : "right");
+      *value1 = abs(navTurnBackAngle);
+    }
+    return;
   } else if (state == NAV_IDLE) {
     // 待执行时展示当前航段
     if (abs(navTurnAngle) > 0.5f) {
       strcpy(step1, navTurnAngle < 0 ? "left" : "right");
       *value1 = abs(navTurnAngle);
-      strcpy(step2, "line");
-      *value2 = navForwardDist;
     } else {
       strcpy(step1, "line");
       *value1 = navForwardDist;
     }
   }
+}
+
+/*
+ * 获取完整计划步骤（用于测试模式显示）
+ * 返回：实际步骤数量
+ */
+int getPlannedStepsForDisplay(char steps[][10], float values[], int maxSteps) {
+  if (maxSteps <= 0) return 0;
+  for (int i = 0; i < maxSteps; i++) {
+    strcpy(steps[i], "");
+    values[i] = 0.0f;
+  }
+
+  if (!pathAvailable || waypointIndex >= waypointCount) {
+    return 0;
+  }
+
+  int count = 0;
+
+  if (macroPlanValid) {
+    if (macroStraight1Cm > 0.5f && count < maxSteps) {
+      strcpy(steps[count], "line");
+      values[count] = macroStraight1Cm;
+      count++;
+    }
+    if (fabs(macroTurnDeg) > 0.5f && count < maxSteps) {
+      strcpy(steps[count], macroTurnDeg < 0 ? "left" : "right");
+      values[count] = fabs(macroTurnDeg);
+      count++;
+    }
+    if (macroDiagDistCm > 0.5f && count < maxSteps) {
+      strcpy(steps[count], "line");
+      values[count] = macroDiagDistCm;
+      count++;
+    }
+    if (fabs(macroTurnDeg) > 0.5f && count < maxSteps) {
+      strcpy(steps[count], macroTurnDeg > 0 ? "left" : "right");
+      values[count] = fabs(macroTurnDeg);
+      count++;
+    }
+    if (macroStraight3Cm > 0.5f && count < maxSteps) {
+      strcpy(steps[count], "line");
+      values[count] = macroStraight3Cm;
+      count++;
+    }
+  }
+
+  if (count == 0) {
+    char step1[10] = "", step2[10] = "", step3[10] = "";
+    float value1 = 0.0f, value2 = 0.0f, value3 = 0.0f;
+    getNextStepInfo(step1, &value1, step2, &value2, step3, &value3);
+    if (strlen(step1) > 0 && count < maxSteps) {
+      strcpy(steps[count], step1);
+      values[count] = value1;
+      count++;
+    }
+    if (strlen(step2) > 0 && count < maxSteps) {
+      strcpy(steps[count], step2);
+      values[count] = value2;
+      count++;
+    }
+    if (strlen(step3) > 0 && count < maxSteps) {
+      strcpy(steps[count], step3);
+      values[count] = value3;
+      count++;
+    }
+  }
+
+  return count;
 }
 
 void findLargestGap();
@@ -179,6 +280,14 @@ void advanceWaypoint();     // 前进到下一个节点后更新当前位置
 bool checkAndBrakeForCollisionImmediate(); // 最新帧的紧急刹停
 bool tryReplanAndSwitchPath(bool stopImmediately); // 在行进阶段尝试重规划，支持平滑/急停切换
 void printPlannedStepsDebug(); // 打印规划出的动作序列（供调试串口查看）
+static void requestReplan(const char* reason); // 标记本轮结束并触发重规划
+static bool buildMacroPlan(int& straightRows, int& diagSteps, int& straightAfterRows, int& diagSign);
+static void startMacroExecution();
+static void computeMacroTurnAndDist(int straightRows, int diagSteps, int diagRows, int startCol, int diagSign,
+                                    float& turnDeg, float& diagDistCm);
+static void setCurrentAction(const char* action, float value);
+static void delayAfterAction();
+static void requestStepPause(const char* reason);
 
 /*
  * 调试：打印当前帧 zValues 的统计信息和部分列值
@@ -283,8 +392,18 @@ void runGapTest()  {
   // 始终刷新占据网格，确保碰撞检测/显示使用最新数据
   fillPointCloudGrid();
 
+  // 正在执行宏路径/航段时不刷新规划，避免中途改路径
+  if (navState != NAV_IDLE && navState != NAV_SEARCHING) {
+    return;
+  }
+
   // 【测试模式】仅输出地图，不执行真实动作
   // 每次规划都输出地图到专用串口，测试刷新速度
+  if (pendingReplanLog) {
+    Serial.print("【重规划】");
+    Serial.println(pendingReplanReason);
+    pendingReplanLog = false;
+  }
   pathAvailable = planPathWithBFS();
   gapFound = pathAvailable; // 兼容旧显示逻辑
 
@@ -308,9 +427,30 @@ void runGapTest()  {
   printPathMap();
   // 调试：输出分解后的动作序列（转向/直行）
   printPlannedStepsDebug();
+
+  // 初始化宏路径参数（用于执行/输出一致）
+  int straightRows = 0;
+  int diagSteps = 0;
+  int straightAfterRows = 0;
+  int diagSign = 0;
+  if (buildMacroPlan(straightRows, diagSteps, straightAfterRows, diagSign)) {
+    macroPlanValid = true;
+    macroStraight1Cm = straightRows * LAYER_HEIGHT;
+    macroStraight3Cm = straightAfterRows * LAYER_HEIGHT;
+    int startCol = waypointCols[0];
+    macroDiagRows = diagSteps; // 斜行段按侧移步数计算
+    computeMacroTurnAndDist(straightRows, diagSteps, macroDiagRows, startCol, diagSign,
+                            macroTurnDeg, macroDiagDistCm);
+  } else {
+    macroPlanValid = false;
+  }
   
-  // 【测试模式】不执行真实动作
-  // navigateToGap();
+  // 执行导航：电机启用才执行，否则仅输出规划结果
+  if (motorDriveState == MOTOR_DRIVE_ENABLED) {
+    navigateToGap();
+  } else {
+    Serial.println("【测试模式】电机未启用，未执行导航");
+  }
 }
 
 /*
@@ -967,12 +1107,13 @@ bool loadNextWaypoint() {
     return loadNextWaypoint();
   }
 
-  float colOffset = targetCol - CENTER_COL;
+  float colOffset = targetCol - currentPoseCol;
   navTurnAngle = -colOffset * ANGLE_STEP;
   navTurnBackAngle = 0.0f;
   navThroughGapDist = 0.0f;
   plannedHeadingDeg = navTurnAngle;
   plannedDistanceCm = navForwardDist;
+  lastSegmentTurnAngle = navTurnAngle;
   return true;
 }
 
@@ -1048,7 +1189,38 @@ void printPlannedStepsDebug() {
     return;
   }
 
-  Serial.println("【规划动作序列】(基于航点)");
+  int straightRows = 0;
+  int diagSteps = 0;
+  int straightAfterRows = 0;
+  int diagSign = 0; // 右为正，左为负
+  if (buildMacroPlan(straightRows, diagSteps, straightAfterRows, diagSign)) {
+    Serial.println("【规划动作序列】(简化4段式: 直行->转向->直行->回正->直行)");
+    int step = 1;
+    if (straightRows > 0) {
+      Serial.printf("  步骤%d: 直行 %.1f cm\n", step++, straightRows * LAYER_HEIGHT);
+    }
+    if (diagSteps > 0) {
+      float sideTurn = 0.0f;
+      float diagDist = 0.0f;
+      int startCol = waypointCols[0];
+      int diagRows = diagSteps;
+      computeMacroTurnAndDist(straightRows, diagSteps, diagRows, startCol, diagSign,
+                              sideTurn, diagDist);
+      Serial.printf("  步骤%d: %s转 %.1f 度\n", step++,
+                    (sideTurn < 0) ? "左" : "右", fabs(sideTurn));
+      Serial.printf("  步骤%d: 直行 %.1f cm\n", step++, diagDist);
+      Serial.printf("  步骤%d: %s转 %.1f 度 (侧移后回正)\n", step++,
+                    (sideTurn > 0) ? "左" : "右", fabs(sideTurn));
+    }
+    if (straightAfterRows > 0 && !REPLAN_AFTER_TURNBACK) {
+      Serial.printf("  步骤%d: 直行 %.1f cm\n", step++, straightAfterRows * LAYER_HEIGHT);
+    }
+    Serial.printf("  终点: 行%d 列%d, 航段数:%d\n",
+                  goalRow + 1, goalCol, waypointCount - 1);
+    return;
+  }
+
+  Serial.println("【规划动作序列】(基于航点, 全路径, 本轮只执行首段)");
 
   int curR = waypointRows[0];
   int curC = waypointCols[0];
@@ -1163,6 +1335,70 @@ void printPlannedStepsDebug() {
 
   Serial.printf("  终点: 行%d 列%d, 航段数:%d\n",
                 goalRow + 1, goalCol, waypointCount - 1);
+}
+
+static bool buildMacroPlan(int& straightRows, int& diagSteps, int& straightAfterRows, int& diagSign) {
+  straightRows = 0;
+  diagSteps = 0;
+  straightAfterRows = 0;
+  diagSign = 0;
+
+  if (waypointCount < 2) return false;
+
+  int i = 1;
+  int curR = waypointRows[0];
+  int curC = waypointCols[0];
+
+  // 段1：起始直行（列不变）
+  while (i < waypointCount) {
+    int nr = waypointRows[i];
+    int nc = waypointCols[i];
+    int dr = nr - curR;
+    int dc = nc - curC;
+    if (dr == 1 && dc == 0) {
+      straightRows++;
+      curR = nr;
+      curC = nc;
+      i++;
+      continue;
+    }
+    break;
+  }
+
+  if (i >= waypointCount) {
+    return true; // 全程直行
+  }
+
+  // 段2：单一方向的斜向侧移
+  int firstDr = waypointRows[i] - curR;
+  int firstDc = waypointCols[i] - curC;
+  if (abs(firstDr) != 1 || abs(firstDc) != 1) {
+    return false; // 不是斜向，无法简化为4段式
+  }
+  diagSign = (firstDc > 0) ? 1 : -1;
+
+  while (i < waypointCount) {
+    int nr = waypointRows[i];
+    int nc = waypointCols[i];
+    int dr = nr - curR;
+    int dc = nc - curC;
+    if (abs(dr) == 1 && abs(dc) == 1 && ((dc > 0) ? 1 : -1) == diagSign) {
+      diagSteps++;
+      curR = nr;
+      curC = nc;
+      i++;
+      continue;
+    }
+    break;
+  }
+
+  // 段3：回正后直行到终点行（列保持当前）
+  int goalR = waypointRows[waypointCount - 1];
+  if (goalR > curR) {
+    straightAfterRows = goalR - curR;
+  }
+
+  return true;
 }
 
 /*
@@ -1670,9 +1906,10 @@ void navigateToGap() {
   // 如果路径刚完成，先停止并延时5秒
   if (pathCompleted) {
     stopMotors();
-    Serial.println("【路径执行完成】停止5秒，准备开始下一帧判断...");
-    delay(5000);
+    Serial.println("【路径执行完成】短暂停顿，准备重新规划...");
+    delay(REPLAN_DELAY_MS);
     pathCompleted = false; // 清除标志
+    setCurrentAction("", 0.0f);
   }
   
   // 如果之前正在导航，先停止当前动作
@@ -1683,12 +1920,23 @@ void navigateToGap() {
   
   if (!pathAvailable || waypointCount < 2) {
     navState = NAV_IDLE;
+    setCurrentAction("", 0.0f);
+    return;
+  }
+
+  executedSegments = 0;
+  pendingBackThenStraight = false;
+  macroActive = false;
+
+  if (macroPlanValid) {
+    startMacroExecution();
     return;
   }
 
   // 装载第一段航段（起点到第一个目标点）
   if (!loadNextWaypoint()) {
     navState = NAV_IDLE;
+    setCurrentAction("", 0.0f);
     return;
   }
 
@@ -1699,16 +1947,19 @@ void navigateToGap() {
     Serial.print("左转 ");
     Serial.print(abs(navTurnAngle), 1);
     Serial.println(" 度");
+    setCurrentAction("left", abs(navTurnAngle));
     turnLeft(abs(navTurnAngle));
   } else if (navTurnAngle > 0.5f) {
     Serial.print("右转 ");
     Serial.print(navTurnAngle, 1);
     Serial.println(" 度");
+    setCurrentAction("right", navTurnAngle);
     turnRight(navTurnAngle);
   } else {
     Serial.println("无需转向，直接前进");
     navTurnAngle = 0.0f;
     navState = NAV_MOVE_TO_ENTRANCE;
+    setCurrentAction("line", navForwardDist);
   }
 }
 
@@ -1719,6 +1970,20 @@ void updateNavigation() {
   // 状态变更时打印一次（简化版）
   if (navState != lastLoggedNavState) {
     lastLoggedNavState = navState;
+  }
+
+  // 如果电机未启用，直接停止并请求重规划
+  if (motorDriveState != MOTOR_DRIVE_ENABLED &&
+      navState != NAV_IDLE &&
+      navState != NAV_SEARCHING) {
+    stopMotors();
+    navState = NAV_IDLE;
+    requestReplan("电机未启用");
+    return;
+  }
+
+  if (stepPauseActive) {
+    return;
   }
 
   // 持续调用电机控制函数，让它们检查状态并完成动作
@@ -1742,16 +2007,34 @@ void updateNavigation() {
     
     // 持续调用转向函数，让它检查时间并完成转向
     if (navTurnAngle < 0) {
+      setCurrentAction("left", abs(navTurnAngle));
       turnLeft(abs(navTurnAngle));
     } else {
+      setCurrentAction("right", navTurnAngle);
       turnRight(navTurnAngle);
     }
     // 检查转向是否完成
     if (!isTurning) {
-      Serial.print("【执行】步骤1完成，步骤2: 直行 ");
-      Serial.print(navForwardDist, 1);
-      Serial.println(" cm");
-      navState = NAV_MOVE_TO_ENTRANCE;
+      delayAfterAction();
+      if (macroActive && macroPhase == 1) {
+        navForwardDist = macroDiagDistCm;
+        navState = NAV_MOVE_TO_ENTRANCE;
+        macroPhase = 2;
+        Serial.print("【执行】宏路径: 直行 ");
+        Serial.print(macroDiagDistCm, 1);
+        Serial.println(" cm");
+        setCurrentAction("line", navForwardDist);
+        requestStepPause("转向完成");
+        return;
+      } else {
+        Serial.print("【执行】步骤1完成，步骤2: 直行 ");
+        Serial.print(navForwardDist, 1);
+        Serial.println(" cm");
+        navState = NAV_MOVE_TO_ENTRANCE;
+        setCurrentAction("line", navForwardDist);
+        requestStepPause("转向完成");
+        return;
+      }
       // 确保移动标志已重置，准备启动前进
       if (isMoving) {
         stopMotors();
@@ -1781,13 +2064,15 @@ void updateNavigation() {
     }
 
     // 行进中尝试重规划（使用最新点云），平滑模式：不强制急停
-    if (tryReplanAndSwitchPath(false)) {
+    // 宏路径执行中不动态重规划，避免中途被打断
+    if (!macroActive && tryReplanAndSwitchPath(false)) {
       Serial.println("【动态重规划】使用新路径，重新执行");
       return;
     }
     
     // 只在没有移动时才启动新的移动，避免重复启动
     if (!isMoving && !wasMoving) {
+      setCurrentAction("line", navForwardDist);
       moveForwardDistance(navForwardDist);
       if (isMoving) {
         wasMoving = true;
@@ -1799,21 +2084,88 @@ void updateNavigation() {
     
     // 检查移动是否完成
     if (wasMoving && !isMoving) {
+      delayAfterAction();
       Serial.println("【执行】步骤2完成，节点到达");
       // 推进到下一个航点
       advanceWaypoint();
       wasMoving = false;
+      executedSegments++;
+
+      if (macroActive) {
+        if (macroPhase == 0) {
+          // 完成直行1
+          if (fabs(macroTurnDeg) > 0.5f) {
+            navTurnAngle = macroTurnDeg;
+            navState = NAV_TURN_TO_GAP;
+            macroPhase = 1;
+            Serial.print("【执行】宏路径: ");
+            Serial.print(macroTurnDeg < 0 ? "左转 " : "右转 ");
+            Serial.print(fabs(macroTurnDeg), 1);
+            Serial.println(" 度");
+            setCurrentAction(macroTurnDeg < 0 ? "left" : "right", fabs(macroTurnDeg));
+            requestStepPause("直行完成");
+            return;
+          } else {
+            navForwardDist = macroStraight3Cm;
+            navState = NAV_MOVE_TO_ENTRANCE;
+            macroPhase = 4;
+            Serial.print("【执行】宏路径: 直行 ");
+            Serial.print(macroStraight3Cm, 1);
+            Serial.println(" cm");
+            setCurrentAction("line", navForwardDist);
+            requestStepPause("直行完成");
+            return;
+          }
+        } else if (macroPhase == 2) {
+          // 完成直行2
+          navTurnBackAngle = -macroTurnDeg;
+          navState = NAV_TURN_BACK;
+          macroPhase = 3;
+          Serial.print("【执行】宏路径: ");
+          Serial.print(macroTurnDeg > 0 ? "左转 " : "右转 ");
+          Serial.print(fabs(macroTurnDeg), 1);
+          Serial.println(" 度 (侧移后回正)");
+          setCurrentAction(macroTurnDeg > 0 ? "left" : "right", fabs(macroTurnDeg));
+          requestStepPause("直行完成");
+          return;
+        } else if (macroPhase == 4) {
+          // 完成直行3
+          stopMotors();
+          navState = NAV_IDLE;
+          macroActive = false;
+          requestReplan("宏路径完成");
+          setCurrentAction("", 0.0f);
+          return;
+        }
+      }
+
+      // 每帧只执行有限航段，执行完后回正再重新规划
+      const int MAX_SEGMENTS_PER_CYCLE = 2; // 尽量形成“直行-转向-直行-回正-直行”节奏
+      if (executedSegments >= MAX_SEGMENTS_PER_CYCLE) {
+        if (fabs(lastSegmentTurnAngle) > 0.5f) {
+          navTurnBackAngle = -lastSegmentTurnAngle;
+          navState = NAV_TURN_BACK;
+          pendingBackThenStraight = true;
+          requestStepPause("直行完成");
+        } else {
+          stopMotors();
+          navState = NAV_IDLE;
+          requestReplan("本轮航段完成");
+        }
+        return;
+      }
 
       // 判断是否还有后续航段
       if (waypointIndex >= waypointCount) {
-        Serial.println("【执行】路径全部完成");
         stopMotors();
         navState = NAV_IDLE;
-        pathCompleted = true;
+        requestReplan("路径完成(本轮)");
       } else {
         // 装载下一段
         if (loadNextWaypoint()) {
           navState = NAV_TURN_TO_GAP;
+          requestStepPause("直行完成");
+          return;
         } else {
           navState = NAV_IDLE;
           pathCompleted = true;
@@ -1822,7 +2174,107 @@ void updateNavigation() {
     }
   }
   else if (navState == NAV_TURN_BACK) {
-    // 新规划不使用，防御留空
+    if (fabs(navTurnBackAngle) > 0.5f) {
+      setCurrentAction(navTurnBackAngle < 0 ? "left" : "right", fabs(navTurnBackAngle));
+      if (navTurnBackAngle < 0) {
+        turnLeft(abs(navTurnBackAngle));
+      } else {
+        turnRight(navTurnBackAngle);
+      }
+      if (!isTurning) {
+        delayAfterAction();
+        stopMotors();
+        if (macroActive && macroPhase == 3) {
+          if (REPLAN_AFTER_TURNBACK) {
+            navState = NAV_IDLE;
+            macroActive = false;
+            requestStepPause("回正完成");
+            requestReplan("回正完成");
+            setCurrentAction("", 0.0f);
+          } else if (macroStraight3Cm > 0.5f) {
+            navForwardDist = macroStraight3Cm;
+            navState = NAV_MOVE_TO_ENTRANCE;
+            macroPhase = 4;
+            Serial.print("【执行】宏路径: 直行 ");
+            Serial.print(macroStraight3Cm, 1);
+            Serial.println(" cm");
+            setCurrentAction("line", navForwardDist);
+            requestStepPause("回正完成");
+          } else {
+            navState = NAV_IDLE;
+            macroActive = false;
+            requestStepPause("回正完成");
+            requestReplan("宏路径完成");
+            setCurrentAction("", 0.0f);
+          }
+          return;
+        }
+        if (pendingBackThenStraight) {
+          pendingBackThenStraight = false;
+          // 尝试在回正后执行一次直行（仅当下一段无需转向）
+          if (loadNextWaypoint() && fabs(navTurnAngle) <= 0.5f) {
+            navTurnAngle = 0.0f;
+            navState = NAV_MOVE_TO_ENTRANCE;
+            setCurrentAction("line", navForwardDist);
+            requestStepPause("回正完成");
+          } else {
+            navState = NAV_IDLE;
+          requestStepPause("回正完成");
+            requestReplan("回正完成");
+            setCurrentAction("", 0.0f);
+          }
+        } else {
+          navState = NAV_IDLE;
+        requestStepPause("回正完成");
+          requestReplan("回正完成");
+          setCurrentAction("", 0.0f);
+        }
+      }
+    } else {
+      delayAfterAction();
+      if (macroActive && macroPhase == 3) {
+        if (REPLAN_AFTER_TURNBACK) {
+          navState = NAV_IDLE;
+          macroActive = false;
+        requestStepPause("回正完成");
+          requestReplan("回正完成");
+          setCurrentAction("", 0.0f);
+        } else if (macroStraight3Cm > 0.5f) {
+          navForwardDist = macroStraight3Cm;
+          navState = NAV_MOVE_TO_ENTRANCE;
+          macroPhase = 4;
+          Serial.print("【执行】宏路径: 直行 ");
+          Serial.print(macroStraight3Cm, 1);
+          Serial.println(" cm");
+          setCurrentAction("line", navForwardDist);
+          requestStepPause("回正完成");
+        } else {
+          navState = NAV_IDLE;
+          macroActive = false;
+        requestStepPause("回正完成");
+          requestReplan("宏路径完成");
+          setCurrentAction("", 0.0f);
+        }
+      } else if (pendingBackThenStraight) {
+        pendingBackThenStraight = false;
+        if (loadNextWaypoint() && fabs(navTurnAngle) <= 0.5f) {
+          navTurnAngle = 0.0f;
+          navState = NAV_MOVE_TO_ENTRANCE;
+          setCurrentAction("line", navForwardDist);
+          requestStepPause("回正完成");
+        } else {
+          navState = NAV_IDLE;
+        requestStepPause("回正完成");
+          requestReplan("回正完成");
+          setCurrentAction("", 0.0f);
+        }
+      } else {
+        navState = NAV_IDLE;
+      requestStepPause("回正完成");
+        requestReplan("回正完成");
+        setCurrentAction("", 0.0f);
+      }
+    }
   }
   else if (navState == NAV_MOVE_THROUGH) {
     // 新规划不使用，防御留空
@@ -1958,19 +2410,30 @@ void moveForward() {
 void moveForwardDistance(float distance) {
   // TODO: 实现按指定距离前进控制
   // 参数: distance - 前进距离（cm）
+  if (motorDriveState != MOTOR_DRIVE_ENABLED) {
+    stopMotors();
+    return;
+  }
   moveDistance(distance);
 }
 
 void turnLeft(float angle) {
   // TODO: 实现左转控制
   // 参数: angle - 转向角度（度）
+  if (motorDriveState != MOTOR_DRIVE_ENABLED) {
+    stopMotors();
+    return;
+  }
   turnAngle(angle);
 }
 
 void turnRight(float angle) {
   // TODO: 实现右转控制
   // 参数: angle - 转向角度（度）
-  
+  if (motorDriveState != MOTOR_DRIVE_ENABLED) {
+    stopMotors();
+    return;
+  }
   turnAngle(angle*(-1.0f));
 }
 
@@ -1978,4 +2441,131 @@ void stopMotors() {
   setSpeed(0, 0);
   isMoving = false;
   isTurning = false;
+}
+
+static void requestReplan(const char* reason) {
+  pathCompleted = true;
+  pendingReplanReason = reason;
+  pendingReplanLog = true;
+  Serial.print("【重规划请求】");
+  Serial.println(reason);
+}
+
+static void setCurrentAction(const char* action, float value) {
+  if (action == nullptr || strlen(action) == 0) {
+    strcpy(currentAction, "");
+    currentActionValue = 0.0f;
+    return;
+  }
+  strcpy(currentAction, action);
+  currentActionValue = value;
+}
+
+static void delayAfterAction() {
+  if (ACTION_STEP_DELAY_MS > 0) {
+    delay(ACTION_STEP_DELAY_MS);
+  }
+}
+
+bool isStepPauseActive() {
+  return stepPauseActive;
+}
+
+void resumeStepPause() {
+  if (!stepPauseActive) return;
+  stepPauseActive = false;
+  Serial.println("【继续】按键继续执行");
+}
+
+static void requestStepPause(const char* reason) {
+  if (motorDriveState != MOTOR_DRIVE_ENABLED) return;
+  stepPauseActive = true;
+  stopMotors();
+  Serial.print("【暂停】");
+  Serial.println(reason);
+}
+
+static void computeMacroTurnAndDist(int straightRows, int diagSteps, int diagRows, int startCol, int diagSign,
+                                    float& turnDeg, float& diagDistCm) {
+  turnDeg = 0.0f;
+  diagDistCm = 0.0f;
+  if (diagSteps <= 0) return;
+
+  int endCol = startCol + diagSign * diagSteps;
+  if (endCol < 0) endCol = 0;
+  if (endCol >= COLS) endCol = COLS - 1;
+  int deltaCols = endCol - startCol;
+
+  int forwardRows = diagRows;
+  if (forwardRows <= 0) forwardRows = diagSteps;
+  float forwardCm = forwardRows * LAYER_HEIGHT;
+  float lateralCm = 0.0f;
+  int baseRow = straightRows;
+  int stepCount = diagSteps;
+
+  for (int i = 1; i <= stepCount; i++) {
+    int rowIndex = baseRow + i;
+    if (rowIndex < 0) rowIndex = 0;
+    if (rowIndex >= TAN_TABLE_SIZE) rowIndex = TAN_TABLE_SIZE - 1;
+    lateralCm += ROW_STEP_WIDTH[rowIndex] * diagSign;
+  }
+
+  float startDistCm = baseRow * LAYER_HEIGHT;
+  float endDistCm = (baseRow + forwardRows) * LAYER_HEIGHT;
+  float startAngleDeg = -((startCol - CENTER_COL) * ANGLE_STEP);
+  float endAngleDeg = -((endCol - CENTER_COL) * ANGLE_STEP);
+  float startX = startDistCm * tan(radians(startAngleDeg));
+  float endX = endDistCm * tan(radians(endAngleDeg));
+  float lateralFromOrigin = endX - startX;
+  lateralCm = lateralFromOrigin;
+
+  float angleRad = atan2(lateralCm, forwardCm);
+  turnDeg = degrees(angleRad);
+  diagDistCm = sqrtf(lateralCm * lateralCm + forwardCm * forwardCm);
+
+  Serial.println("【宏路径角度计算】");
+  Serial.printf("  直行行数=%d, 侧移步数=%d, 斜行行数=%d, 起始列=%d, 目标列=%d, 列偏移=%d\n",
+                straightRows, diagSteps, diagRows, startCol, endCol, deltaCols);
+  Serial.printf("  转向起点行=%d, 侧移累积行=%d\n", baseRow, baseRow + stepCount);
+  Serial.println("  横向位移公式=终点x-起点x, x=距离*tan(列角)");
+  Serial.printf("  起点: 距离=%.2fcm, 列角=%.2f°, x=%.2f\n",
+                startDistCm, startAngleDeg, startX);
+  Serial.printf("  终点: 距离=%.2fcm, 列角=%.2f°, x=%.2f\n",
+                endDistCm, endAngleDeg, endX);
+  Serial.printf("  横向位移=%.2f cm, 前向位移=%.2f cm\n", lateralCm, forwardCm);
+  Serial.printf("  转向角=%.2f 度, 斜向直行=%.2f cm\n", turnDeg, diagDistCm);
+}
+
+static void startMacroExecution() {
+  macroActive = true;
+  macroPhase = 0;
+
+  if (macroStraight1Cm > 0.5f) {
+    Serial.print("【执行】宏路径: 直行 ");
+    Serial.print(macroStraight1Cm, 1);
+    Serial.println(" cm");
+    navTurnAngle = 0.0f;
+    navForwardDist = macroStraight1Cm;
+    navState = NAV_MOVE_TO_ENTRANCE;
+  } else if (fabs(macroTurnDeg) > 0.5f) {
+    navTurnAngle = macroTurnDeg;
+    navState = NAV_TURN_TO_GAP;
+    macroPhase = 1;
+    Serial.print("【执行】宏路径: ");
+    Serial.print(macroTurnDeg < 0 ? "左转 " : "右转 ");
+    Serial.print(fabs(macroTurnDeg), 1);
+    Serial.println(" 度");
+  } else if (macroStraight3Cm > 0.5f) {
+    Serial.print("【执行】宏路径: 直行 ");
+    Serial.print(macroStraight3Cm, 1);
+    Serial.println(" cm");
+    navTurnAngle = 0.0f;
+    navForwardDist = macroStraight3Cm;
+    navState = NAV_MOVE_TO_ENTRANCE;
+    macroPhase = 4;
+  } else {
+    macroActive = false;
+    navState = NAV_IDLE;
+    requestReplan("宏路径为空");
+  }
 }

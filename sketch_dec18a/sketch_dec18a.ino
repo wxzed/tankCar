@@ -65,7 +65,6 @@ void oledInit(void)
 
 void updateDisplay()
 {
-  if(motorDriveState == MOTOR_DRIVE_ENABLED) return;
   static unsigned long lastUpdate = 0;
   if (millis() - lastUpdate < 200) return; // 刷新频率
   lastUpdate = millis();
@@ -106,42 +105,59 @@ void updateDisplay()
         break;
     }
   } else {
-    // 正常模式：显示下一步执行步骤
-    char step1[10] = "", step2[10] = "", step3[10] = "";
-    float value1 = 0.0, value2 = 0.0, value3 = 0.0;
-    
-    getNextStepInfo(step1, &value1, step2, &value2, step3, &value3);
-    
-    // 显示步骤1
-    if (strlen(step1) > 0) {
-      display.print(step1);
-      display.print(":");
-      display.print((int)value1);
-      if (strlen(step2) > 0 || strlen(step3) > 0) {
-        display.print(",");
+    if (motorDriveState != MOTOR_DRIVE_ENABLED) {
+      // 测试模式：显示完整计划步骤
+      char steps[6][10];
+      float values[6];
+      int count = getPlannedStepsForDisplay(steps, values, 6);
+      if (count == 0) {
+        display.print("IDLE");
+      } else {
+        for (int i = 0; i < count; i++) {
+          display.setCursor(0, i * 10);
+          display.print(steps[i]);
+          display.print(":");
+          display.print((int)values[i]);
+        }
       }
-    }
-    
-    // 显示步骤2
-    if (strlen(step2) > 0) {
-      display.print(step2);
-      display.print(":");
-      display.print((int)value2);
+    } else {
+      // 正常模式：显示下一步执行步骤
+      char step1[10] = "", step2[10] = "", step3[10] = "";
+      float value1 = 0.0, value2 = 0.0, value3 = 0.0;
+
+      getNextStepInfo(step1, &value1, step2, &value2, step3, &value3);
+
+      // 显示步骤1
+      if (strlen(step1) > 0) {
+        display.print(step1);
+        display.print(":");
+        display.print((int)value1);
+        if (strlen(step2) > 0 || strlen(step3) > 0) {
+          display.print(",");
+        }
+      }
+
+      // 显示步骤2
+      if (strlen(step2) > 0) {
+        display.print(step2);
+        display.print(":");
+        display.print((int)value2);
+        if (strlen(step3) > 0) {
+          display.print(",");
+        }
+      }
+
+      // 显示步骤3
       if (strlen(step3) > 0) {
-        display.print(",");
+        display.print(step3);
+        display.print(":");
+        display.print((int)value3);
       }
-    }
-    
-    // 显示步骤3
-    if (strlen(step3) > 0) {
-      display.print(step3);
-      display.print(":");
-      display.print((int)value3);
-    }
-    
-    // 如果没有步骤信息，显示状态
-    if (strlen(step1) == 0 && strlen(step2) == 0 && strlen(step3) == 0) {
-      display.print("IDLE");
+
+      // 如果没有步骤信息，显示状态
+      if (strlen(step1) == 0 && strlen(step2) == 0 && strlen(step3) == 0) {
+        display.print("IDLE");
+      }
     }
   }
   
@@ -189,7 +205,13 @@ void loop() {
   static long  analysisCount = 0;
   static long  startWaitAnalysisCount = 0;
   updateDisplay();
-  handleKeyEvents();
+  if (isStepPauseActive()) {
+    if (keyCheck()) {
+      resumeStepPause();
+    }
+  } else {
+    handleKeyEvents();
+  }
   updateNavigation();  // 更新导航状态机（持续调用电机控制函数）
   //test();
   // if(motorDriveState == MOTOR_DRIVE_ENABLED)
