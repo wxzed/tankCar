@@ -90,6 +90,8 @@ static float lastSegmentTurnAngle = 0.0f;  // 最近航段的转向角
 static bool pendingReplanLog = false;
 static const char* pendingReplanReason = "";
 static bool pendingBackThenStraight = false; // 回正后是否再执行一次直行
+static bool pendingTurnBackStraight = false; // 回正后插入一次直行，再重规划
+static const float TURNBACK_STRAIGHT_CM = 20.0f;
 static bool macroPlanValid = false;
 static bool macroActive = false;
 static int macroPhase = 0; // 0=直行1,1=转向,2=直行2,3=回正,4=直行3
@@ -276,13 +278,17 @@ float calculateObstacleBalanceScore(int row, int col); // 计算当前点两侧�
 int calculateCorridorWidth(int row, int col); // 计算当前位置通道宽度（越大越宽）
 bool planPathWithBFS();     // 基于BFS的路径规划
 void markPathOnMap(int parentRow[ROWS][COLS], int parentCol[ROWS][COLS], int endR, int endC);
+static void smoothShortLateralRuns();
+static bool isPlanningObstacle(int row, int col);
+static void markWaypointsOnMap();
 bool loadNextWaypoint();    // 计算下一个航段的转角与距离
 void advanceWaypoint();     // 前进到下一个节点后更新当前位置
 bool checkAndBrakeForCollisionImmediate(); // 最新帧的紧急刹停
 bool tryReplanAndSwitchPath(bool stopImmediately); // 在行进阶段尝试重规划，支持平滑/急停切换
 void printPlannedStepsDebug(); // 打印规划出的动作序列（供调试串口查看）
 static void requestReplan(const char* reason); // 标记本轮结束并触发重规划
-static bool buildMacroPlan(int& straightRows, int& diagSteps, int& straightAfterRows, int& diagSign);
+static bool buildMacroPlan(int& straightRows, int& diagSteps, int& diagRows,
+                           int& straightAfterRows, int& diagSign);
 static void startMacroExecution();
 static void computeMacroTurnAndDist(int straightRows, int diagSteps, int diagRows, int startCol, int diagSign,
                                     float& turnDeg, float& diagDistCm);
@@ -400,6 +406,11 @@ void runGapTest()  {
   // 始终刷新占据网格，确保碰撞检测/显示使用最新数据
   fillPointCloudGrid();
 
+  // 步进暂停时不进行重规划
+  if (stepPauseActive) {
+    return;
+  }
+
   // 正在执行宏路径/航段时不刷新规划，避免中途改路径
   if (navState != NAV_IDLE && navState != NAV_SEARCHING) {
     return;
@@ -439,14 +450,15 @@ void runGapTest()  {
   // 初始化宏路径参数（用于执行/输出一致）
   int straightRows = 0;
   int diagSteps = 0;
+  int diagRows = 0;
   int straightAfterRows = 0;
   int diagSign = 0;
-  if (buildMacroPlan(straightRows, diagSteps, straightAfterRows, diagSign)) {
+  if (buildMacroPlan(straightRows, diagSteps, diagRows, straightAfterRows, diagSign)) {
     macroPlanValid = true;
     macroStraight1Cm = straightRows * LAYER_HEIGHT;
     macroStraight3Cm = straightAfterRows * LAYER_HEIGHT;
     int startCol = waypointCols[0];
-    macroDiagRows = diagSteps; // 斜行段按侧移步数计算
+    macroDiagRows = diagRows; // 斜行段按侧移累积行计算
     computeMacroTurnAndDist(straightRows, diagSteps, macroDiagRows, startCol, diagSign,
                             macroTurnDeg, macroDiagDistCm);
   } else {
@@ -798,14 +810,14 @@ bool planPathWithBFS() {
   currentPoseCol = startCol;
 
   // 起点补偿：如果中心被占据，向两侧寻找最近的空点
-  if (pointCloudGrid[startRow][startCol] != 0) {
+  if (isPlanningObstacle(startRow, startCol)) {
     bool found = false;
     const int SPAN = 3;
     for (int off = 1; off <= SPAN && !found; off++) {
-      if (startCol - off >= 0 && pointCloudGrid[startRow][startCol - off] == 0) {
+      if (startCol - off >= 0 && !isPlanningObstacle(startRow, startCol - off)) {
         startCol -= off;
         found = true;
-      } else if (startCol + off < COLS && pointCloudGrid[startRow][startCol + off] == 0) {
+      } else if (startCol + off < COLS && !isPlanningObstacle(startRow, startCol + off)) {
         startCol += off;
         found = true;
       }
@@ -876,13 +888,13 @@ bool planPathWithBFS() {
     // 检查两侧是否都有障碍物（距离都不是最大值）
     int leftDist = 0, rightDist = 0;
     for (int c2 = c - 1; c2 >= 0; c2--) {
-      if (pointCloudGrid[r][c2] != 0) break;
+      if (isPlanningObstacle(r, c2)) break;
       leftDist++;
     }
     if (leftDist == c) leftDist = COLS;
 
     for (int c2 = c + 1; c2 < COLS; c2++) {
-      if (pointCloudGrid[r][c2] != 0) break;
+      if (isPlanningObstacle(r, c2)) break;
       rightDist++;
     }
     if (rightDist == COLS - c - 1) rightDist = COLS;
@@ -897,6 +909,11 @@ bool planPathWithBFS() {
     const int SAFE_MARGIN_COLS = 1;
     const int REQUIRED_CLEAR = CAR_HALF_COLS + SAFE_MARGIN_COLS;
     const int IDEAL_CLEAR = REQUIRED_CLEAR + 1; // 期望至少再留一列缓冲
+    int effectiveMinSideClear = minSideClear;
+    if (!hasLeftObstacle || !hasRightObstacle) {
+      // 一侧无遮挡时，限制净空奖励，避免向开阔侧无限漂移
+      effectiveMinSideClear = min(minSideClear, IDEAL_CLEAR);
+    }
 
     // 自适应评分：不再强偏直行，前段降低直行权重以便提前转向
     float straightWeight = 220.0f;
@@ -914,14 +931,18 @@ bool planPathWithBFS() {
     // 当一侧空间明显更大时，鼓励提前朝开阔侧偏移，避免被迫向狭窄侧绕行
     int sideDiff = leftDist - rightDist;                   // 正值=左侧更开阔，负值=右侧更开阔
     float sideBias = 0.0f;
-    if (abs(sideDiff) >= 2) {
-      // 放宽“贴中线”惩罚，允许更早偏向开阔侧
-      straightWeight *= 0.5f;
+    if (abs(sideDiff) >= 3) {
+      // 通道足够宽时，几乎禁用“朝开阔侧偏移”的倾向，避免因边缘细节偏线
+      float sideBiasScale = (minSideClear >= IDEAL_CLEAR) ? 0.0f : 0.6f;
+      if (minSideClear < IDEAL_CLEAR) {
+        // 放宽“贴中线”惩罚，允许更早偏向开阔侧
+        straightWeight *= 0.5f;
+      }
       // 朝开阔侧移动时给予奖励（限制奖励幅度，避免贴边）
       int towardOpen = (sideDiff > 0) ? (int)round(CENTER_COL - c) : (int)round(c - CENTER_COL);
       if (towardOpen > 0) {
         int cappedCols = min(towardOpen, 8);               // 最多奖励偏移8列
-        sideBias = cappedCols * 160.0f;
+        sideBias = cappedCols * 160.0f * sideBiasScale;
       }
       // 单侧开阔时不必强制平衡
       if (!hasLeftObstacle || !hasRightObstacle) {
@@ -952,8 +973,8 @@ bool planPathWithBFS() {
     }
     // 净空奖励：鼓励走在更宽裕的区域（早期更敏感）
     float clearReward = 0.0f;
-    if (minSideClear >= IDEAL_CLEAR) {
-      clearReward = (minSideClear - IDEAL_CLEAR + 1) * (r <= 8 ? 180.0f : 120.0f);
+    if (effectiveMinSideClear >= IDEAL_CLEAR) {
+      clearReward = (effectiveMinSideClear - IDEAL_CLEAR + 1) * (r <= 8 ? 180.0f : 120.0f);
     }
 
     // 转向平滑：惩罚与父节点的列跳变，鼓励小角度微调
@@ -980,12 +1001,12 @@ bool planPathWithBFS() {
       // 统计前方“侧向净空不足”的行数，用于提前转向
       int l2 = 0, r2 = 0;
       for (int c2 = c - 1; c2 >= 0; c2--) {
-        if (pointCloudGrid[rr][c2] != 0) break;
+      if (isPlanningObstacle(rr, c2)) break;
         l2++;
       }
       if (l2 == c) l2 = COLS;
       for (int c2 = c + 1; c2 < COLS; c2++) {
-        if (pointCloudGrid[rr][c2] != 0) break;
+      if (isPlanningObstacle(rr, c2)) break;
         r2++;
       }
       if (r2 == COLS - c - 1) r2 = COLS;
@@ -1011,6 +1032,24 @@ bool planPathWithBFS() {
       straightPenalty *= 0.5f;
     }
 
+    // 当前方宽裕且通道足够宽时，减弱对“偏好列”的追随，避免边缘小变化引发偏移
+    if (minSideClear >= IDEAL_CLEAR && forwardClearRows >= 3) {
+      preferredPenalty *= 0.05f;
+    }
+
+    // 通道宽且左右相对均衡时，额外惩罚偏离中心，减少不必要偏移
+    float centerPenalty = 0.0f;
+    if (minSideClear >= REQUIRED_CLEAR && abs(sideDiff) <= 3) {
+      float centerOffset = abs(c - (int)round(CENTER_COL));
+      centerPenalty = centerOffset * 600.0f;
+    }
+    // 单侧无遮挡时，压制“向开阔侧漂移”
+    float openSidePenalty = 0.0f;
+    if ((!hasLeftObstacle || !hasRightObstacle) && minSideClear >= REQUIRED_CLEAR) {
+      float centerOffset = abs(c - (int)round(CENTER_COL));
+      openSidePenalty = centerOffset * 520.0f;
+    }
+
     // 通道宽度偏好：满足车身宽度前提下，越宽越好，但深度权重更高
     int corridorWidth = leftDist + rightDist + 1;
     if (leftDist >= COLS || rightDist >= COLS) {
@@ -1029,7 +1068,7 @@ bool planPathWithBFS() {
                   + clearReward
                   - forwardTightPenalty - forwardNearPenalty - earlyForwardPenalty
                   - nearObstaclePenalty - earlyHazardPenalty - adjacentPenalty
-                  - preferredPenalty;
+                  - preferredPenalty - centerPenalty - openSidePenalty;
 
     // 记录更优点；分数接近时优先中心、更平衡
     int bestCorridorWidth = calculateCorridorWidth(bestR, bestC);
@@ -1062,7 +1101,75 @@ bool planPathWithBFS() {
       int nc = c + dc[k];
       if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) continue;
       if (visited[nr][nc]) continue;
-      if (pointCloudGrid[nr][nc] != 0) continue;
+      if (isPlanningObstacle(nr, nc)) continue;
+
+      // 避免“前后直，中间一行偏移”：当前方仍宽裕时延后侧移
+      if (abs(nr - r) == 1 && abs(nc - c) == 1) {
+        // 若本行前向直走仍安全，则直接禁止侧移
+        float curDistCm = (r + 1) * LAYER_HEIGHT;
+        if (checkPathWidth(r, c, curDistCm)) {
+          int l0 = 0;
+          for (int c2 = c - 1; c2 >= 0; c2--) {
+            if (isPlanningObstacle(r, c2)) break;
+            l0++;
+          }
+          if (l0 == c) l0 = COLS;
+          int r0 = 0;
+          for (int c2 = c + 1; c2 < COLS; c2++) {
+            if (isPlanningObstacle(r, c2)) break;
+            r0++;
+          }
+          if (r0 == COLS - c - 1) r0 = COLS;
+          int minSide0 = min(l0, r0);
+          if (minSide0 >= REQUIRED_CLEAR) {
+            continue;
+          }
+        }
+
+        bool forwardOpen = true;
+        int nextR = r + 1;
+        if (nextR >= ROWS) {
+          forwardOpen = false;
+        } else {
+          float nextDistCm = (nextR + 1) * LAYER_HEIGHT;
+          if (isPlanningObstacle(nextR, c) || !checkPathWidth(nextR, c, nextDistCm)) {
+            forwardOpen = false;
+          }
+        }
+        if (forwardOpen) {
+          const int DIAG_AVOID_LOOKAHEAD = 3;
+          bool nearTight = false;
+          for (int step = 1; step <= DIAG_AVOID_LOOKAHEAD; step++) {
+            int rr = r + step;
+            if (rr >= ROWS) break;
+            float distCm = (rr + 1) * LAYER_HEIGHT;
+            if (isPlanningObstacle(rr, c) || !checkPathWidth(rr, c, distCm)) {
+              nearTight = true;
+              break;
+            }
+            int l2 = 0;
+            for (int c2 = c - 1; c2 >= 0; c2--) {
+              if (isPlanningObstacle(rr, c2)) break;
+              l2++;
+            }
+            if (l2 == c) l2 = COLS;
+            int r2 = 0;
+            for (int c2 = c + 1; c2 < COLS; c2++) {
+              if (isPlanningObstacle(rr, c2)) break;
+              r2++;
+            }
+            if (r2 == COLS - c - 1) r2 = COLS;
+            int minSide2 = min(l2, r2);
+            if (minSide2 < REQUIRED_CLEAR) {
+              nearTight = true;
+              break;
+            }
+          }
+          if (!nearTight) {
+            continue;
+          }
+        }
+      }
 
       float distCm = (nr + 1) * LAYER_HEIGHT;
       if (!checkPathWidth(nr, nc, distCm)) continue;
@@ -1085,8 +1192,6 @@ bool planPathWithBFS() {
   goalRow = bestR;
   goalCol = bestC;
 
-  // 回溯标记路径
-  markPathOnMap(parentR, parentC, goalRow, goalCol);
   // 回溯收集路径节点（从起点到终点的有序列表）
   int tempR[ROWS * COLS];
   int tempC[ROWS * COLS];
@@ -1116,6 +1221,12 @@ bool planPathWithBFS() {
     waypointCount++;
     if (waypointCount >= ROWS * COLS) break;
   }
+  smoothShortLateralRuns();
+  goalRow = waypointRows[waypointCount - 1];
+  goalCol = waypointCols[waypointCount - 1];
+  // 重新标记路径地图，确保显示与修正后的航点一致
+  initializePathMap();
+  markWaypointsOnMap();
   waypointIndex = 1; // 第0个是起点，执行从第1个节点开始
 
   // 航向角：相对中心列的偏移，左为正
@@ -1174,6 +1285,66 @@ void markPathOnMap(int parentRow[ROWS][COLS], int parentCol[ROWS][COLS], int end
     if (pr == -1 || pc == -1) break;
     r = pr;
     c = pc;
+  }
+}
+
+static void smoothShortLateralRuns() {
+  if (waypointCount < 3) return;
+  const int MAX_SHORT_RUN = 2; // 最多2行的短侧移会尝试拉直
+
+  int i = 1;
+  while (i < waypointCount - 1) {
+    int baseCol = waypointCols[i - 1];
+    if (waypointCols[i] == baseCol) {
+      i++;
+      continue;
+    }
+
+    int start = i;
+    while (i < waypointCount && waypointCols[i] != baseCol) {
+      i++;
+    }
+    if (i >= waypointCount) break; // 未回到原列，跳过
+    int end = i - 1;
+    int runLen = end - start + 1;
+
+    if (runLen <= MAX_SHORT_RUN) {
+      bool canStraight = true;
+      for (int k = start; k <= end; k++) {
+        int row = waypointRows[k];
+        float distCm = (row + 1) * LAYER_HEIGHT;
+        if (baseCol < 0 || baseCol >= COLS) {
+          canStraight = false;
+          break;
+        }
+        if (isPlanningObstacle(row, baseCol) || !checkPathWidth(row, baseCol, distCm)) {
+          canStraight = false;
+          break;
+        }
+      }
+      if (canStraight) {
+        for (int k = start; k <= end; k++) {
+          waypointCols[k] = baseCol;
+        }
+      }
+    }
+  }
+}
+
+static void markWaypointsOnMap() {
+  for (int i = 0; i < waypointCount; i++) {
+    int r = waypointRows[i];
+    int c = waypointCols[i];
+    float distCm = (r + 1) * LAYER_HEIGHT;
+    int startCol = 0;
+    int endCol = 0;
+    calculateCarWidthColumns(distCm, c, startCol, endCol);
+    for (int col = startCol; col <= endCol; col++) {
+      if (col < 0 || col >= COLS) continue;
+      if (pointCloudGrid[r][col] == 0) {
+        pathMap[r][col] = 2;
+      }
+    }
   }
 }
 
@@ -1282,9 +1453,10 @@ void printPlannedStepsDebug() {
 
   int straightRows = 0;
   int diagSteps = 0;
+  int diagRows = 0;
   int straightAfterRows = 0;
   int diagSign = 0; // 右为正，左为负
-  if (buildMacroPlan(straightRows, diagSteps, straightAfterRows, diagSign)) {
+  if (buildMacroPlan(straightRows, diagSteps, diagRows, straightAfterRows, diagSign)) {
     Serial.println("【规划动作序列】(简化4段式: 直行->转向->直行->回正->直行)");
     int step = 1;
     if (straightRows > 0) {
@@ -1294,7 +1466,6 @@ void printPlannedStepsDebug() {
       float sideTurn = 0.0f;
       float diagDist = 0.0f;
       int startCol = waypointCols[0];
-      int diagRows = diagSteps;
       computeMacroTurnAndDist(straightRows, diagSteps, diagRows, startCol, diagSign,
                               sideTurn, diagDist);
       Serial.printf("  步骤%d: %s转 %.1f 度\n", step++,
@@ -1428,9 +1599,11 @@ void printPlannedStepsDebug() {
                 goalRow + 1, goalCol, waypointCount - 1);
 }
 
-static bool buildMacroPlan(int& straightRows, int& diagSteps, int& straightAfterRows, int& diagSign) {
+static bool buildMacroPlan(int& straightRows, int& diagSteps, int& diagRows,
+                           int& straightAfterRows, int& diagSign) {
   straightRows = 0;
   diagSteps = 0;
+  diagRows = 0;
   straightAfterRows = 0;
   diagSign = 0;
 
@@ -1467,26 +1640,48 @@ static bool buildMacroPlan(int& straightRows, int& diagSteps, int& straightAfter
     return false; // 不是斜向，无法简化为4段式
   }
   diagSign = (firstDc > 0) ? 1 : -1;
+  int diagStartRow = curR;
+  int lastShiftRow = curR;
 
   while (i < waypointCount) {
     int nr = waypointRows[i];
     int nc = waypointCols[i];
     int dr = nr - curR;
     int dc = nc - curC;
-    if (abs(dr) == 1 && abs(dc) == 1 && ((dc > 0) ? 1 : -1) == diagSign) {
-      diagSteps++;
+    if (dr <= 0) {
+      return false; // 非前进路径无法简化
+    }
+    if (dc == 0) {
       curR = nr;
       curC = nc;
       i++;
       continue;
     }
-    break;
+    int sign = (dc > 0) ? 1 : -1;
+    if (sign != diagSign) {
+      return false; // 侧移方向变化，无法简化
+    }
+    if (abs(dr) != 1 || abs(dc) != 1) {
+      return false; // 仅支持45度斜向
+    }
+    diagSteps++;
+    curR = nr;
+    curC = nc;
+    lastShiftRow = curR;
+    i++;
   }
+
+  if (diagSteps <= 0) {
+    return false;
+  }
+
+  // 斜向阶段覆盖的总行数：从斜向开始到最后一次侧移的行
+  diagRows = lastShiftRow - diagStartRow;
 
   // 段3：回正后直行到终点行（列保持当前）
   int goalR = waypointRows[waypointCount - 1];
-  if (goalR > curR) {
-    straightAfterRows = goalR - curR;
+  if (goalR > lastShiftRow) {
+    straightAfterRows = goalR - lastShiftRow;
   }
 
   return true;
@@ -1533,12 +1728,12 @@ void calculateCarWidthColumns(float distance, int centerCol, int& startCol, int&
 
   int leftSpace = 0;
   for (int c = centerCol - 1; c >= 0; c--) {
-    if (pointCloudGrid[row][c] != 0) break;
+    if (isPlanningObstacle(row, c)) break;
     leftSpace++;
   }
   int rightSpace = 0;
   for (int c = centerCol + 1; c < COLS; c++) {
-    if (pointCloudGrid[row][c] != 0) break;
+    if (isPlanningObstacle(row, c)) break;
     rightSpace++;
   }
 
@@ -1558,6 +1753,12 @@ void calculateCarWidthColumns(float distance, int centerCol, int& startCol, int&
  * 参数：row - 行索引，centerCol - 中心列索引，distance - 距离（cm）
  * 返回：true表示有足够空间，false表示空间不足
  */
+static bool isPlanningObstacle(int row, int col) {
+  if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return true;
+  if (col == 0 || col == COLS - 1) return true; // 规划时固定将两侧边界列视为障碍
+  return pointCloudGrid[row][col] != 0;
+}
+
 bool checkPathWidth(int row, int centerCol, float distance) {
   if (row < 0 || row >= ROWS || centerCol < 0 || centerCol >= COLS) {
     return false;
@@ -1572,7 +1773,7 @@ bool checkPathWidth(int row, int centerCol, float distance) {
     if (col < 0 || col >= COLS) {
       return false;  // 超出边界
     }
-    if (pointCloudGrid[row][col] != 0) {
+    if (isPlanningObstacle(row, col)) {
       return false;  // 有障碍物
     }
   }
@@ -1585,14 +1786,14 @@ bool checkPathWidth(int row, int centerCol, float distance) {
   
   // 检查左侧安全边距（检查安全边距范围内的所有列）
   for (int col = safeStartCol; col < startCol; col++) {
-    if (col >= 0 && col < COLS && pointCloudGrid[row][col] != 0) {
+    if (col >= 0 && col < COLS && isPlanningObstacle(row, col)) {
       return false;  // 左侧太靠近障碍物
     }
   }
   
   // 检查右侧安全边距（检查安全边距范围内的所有列）
   for (int col = endCol + 1; col <= safeEndCol; col++) {
-    if (col >= 0 && col < COLS && pointCloudGrid[row][col] != 0) {
+    if (col >= 0 && col < COLS && isPlanningObstacle(row, col)) {
       return false;  // 右侧太靠近障碍物
     }
   }
@@ -1614,7 +1815,7 @@ float calculateObstacleBalanceScore(int row, int col) {
   // 向左查找最近的障碍物
   int leftDist = 0;
   for (int c = col - 1; c >= 0; c--) {
-    if (pointCloudGrid[row][c] != 0) {
+    if (isPlanningObstacle(row, c)) {
       break;  // 找到障碍物
     }
     leftDist++;
@@ -1626,7 +1827,7 @@ float calculateObstacleBalanceScore(int row, int col) {
   // 向右查找最近的障碍物
   int rightDist = 0;
   for (int c = col + 1; c < COLS; c++) {
-    if (pointCloudGrid[row][c] != 0) {
+    if (isPlanningObstacle(row, c)) {
       break;  // 找到障碍物
     }
     rightDist++;
@@ -1650,7 +1851,7 @@ int calculateCorridorWidth(int row, int col) {
 
   int leftDist = 0;
   for (int c = col - 1; c >= 0; c--) {
-    if (pointCloudGrid[row][c] != 0) {
+    if (isPlanningObstacle(row, c)) {
       break;
     }
     leftDist++;
@@ -1661,7 +1862,7 @@ int calculateCorridorWidth(int row, int col) {
 
   int rightDist = 0;
   for (int c = col + 1; c < COLS; c++) {
-    if (pointCloudGrid[row][c] != 0) {
+    if (isPlanningObstacle(row, c)) {
       break;
     }
     rightDist++;
@@ -1678,12 +1879,82 @@ int calculateCorridorWidth(int row, int col) {
  */
 static void computePreferredCols() {
   int prev = (int)round(CENTER_COL);
+  const int CAR_HALF_COLS = 2; // 车身4列宽
+  const int SAFE_MARGIN_COLS = 1;
+  const int REQUIRED_CLEAR = CAR_HALF_COLS + SAFE_MARGIN_COLS;
+  const int IDEAL_CLEAR = REQUIRED_CLEAR + 1;
+  const int minPassCols = 6; // 车宽4列 + 左右安全边距1列
   for (int r = 0; r < ROWS; r++) {
+    // 如果上一列在当前行仍可行，优先保持，避免因边缘小变化导致抖动
+    if (prev >= 0 && prev < COLS) {
+      float distCm = (r + 1) * LAYER_HEIGHT;
+      if (!isPlanningObstacle(r, prev) && checkPathWidth(r, prev, distCm)) {
+        int leftDist = 0;
+        for (int c2 = prev - 1; c2 >= 0; c2--) {
+          if (isPlanningObstacle(r, c2)) break;
+          leftDist++;
+        }
+        if (leftDist == prev) leftDist = COLS;
+        int rightDist = 0;
+        for (int c2 = prev + 1; c2 < COLS; c2++) {
+          if (isPlanningObstacle(r, c2)) break;
+          rightDist++;
+        }
+        if (rightDist == COLS - prev - 1) rightDist = COLS;
+        int minClear = min(leftDist, rightDist);
+        if (minClear >= REQUIRED_CLEAR) {
+          preferredCols[r] = prev;
+          continue;
+        }
+      }
+    }
+
+    // 通道足够宽且中心列可行时，优先锁定中心，避免无必要的偏线
+    const int centerC = (int)round(CENTER_COL);
+    if (centerC >= 0 && centerC < COLS) {
+      int minClearMin = 9999;
+      int widthAtRow = calculateCorridorWidth(r, centerC);
+      bool validCenter = true;
+      for (int step = 0; step <= 8; step++) {
+        int rr = r + step;
+        if (rr >= ROWS) break;
+        float distCm = (rr + 1) * LAYER_HEIGHT;
+        if (isPlanningObstacle(rr, centerC)) {
+          validCenter = false;
+          break;
+        }
+        if (!checkPathWidth(rr, centerC, distCm)) {
+          validCenter = false;
+          break;
+        }
+        int leftDist = 0;
+        for (int c2 = centerC - 1; c2 >= 0; c2--) {
+          if (isPlanningObstacle(rr, c2)) break;
+          leftDist++;
+        }
+        if (leftDist == centerC) leftDist = COLS;
+        int rightDist = 0;
+        for (int c2 = centerC + 1; c2 < COLS; c2++) {
+          if (isPlanningObstacle(rr, c2)) break;
+          rightDist++;
+        }
+        if (rightDist == COLS - centerC - 1) rightDist = COLS;
+        int minClear = min(leftDist, rightDist);
+        minClearMin = min(minClearMin, minClear);
+      }
+      if (validCenter && minClearMin >= IDEAL_CLEAR && widthAtRow >= minPassCols) {
+        preferredCols[r] = centerC;
+        prev = centerC;
+        continue;
+      }
+    }
+
     int bestC = -1;
     int bestMin = -1;
     float bestAvg = -1.0f;
     int bestWidth = -1;
     int bestOffset = 9999;
+    int bestCenterOffset = 9999;
     const int PREF_LOOKAHEAD = 8;
 
     for (int c = 0; c < COLS; c++) {
@@ -1696,7 +1967,7 @@ static void computePreferredCols() {
         int rr = r + step;
         if (rr >= ROWS) break;
         float distCm = (rr + 1) * LAYER_HEIGHT;
-        if (pointCloudGrid[rr][c] != 0) {
+        if (isPlanningObstacle(rr, c)) {
           valid = false;
           break;
         }
@@ -1707,19 +1978,23 @@ static void computePreferredCols() {
 
         int leftDist = 0;
         for (int c2 = c - 1; c2 >= 0; c2--) {
-          if (pointCloudGrid[rr][c2] != 0) break;
+          if (isPlanningObstacle(rr, c2)) break;
           leftDist++;
         }
         if (leftDist == c) leftDist = COLS;
 
         int rightDist = 0;
         for (int c2 = c + 1; c2 < COLS; c2++) {
-          if (pointCloudGrid[rr][c2] != 0) break;
+          if (isPlanningObstacle(rr, c2)) break;
           rightDist++;
         }
         if (rightDist == COLS - c - 1) rightDist = COLS;
 
         int minClear = min(leftDist, rightDist);
+        if (leftDist >= COLS || rightDist >= COLS) {
+          // 一侧无遮挡时，不让“极大净空”拉偏路径
+          minClear = min(minClear, IDEAL_CLEAR);
+        }
         minClearMin = min(minClearMin, minClear);
         minClearSum += (float)minClear;
         samples++;
@@ -1729,16 +2004,20 @@ static void computePreferredCols() {
 
       float avgClear = minClearSum / (float)samples;
       int offset = abs(c - prev);
+      int centerOffset = abs(c - (int)round(CENTER_COL));
       int width = calculateCorridorWidth(r, c);
 
       if (minClearMin > bestMin ||
           (minClearMin == bestMin && avgClear > bestAvg) ||
           (minClearMin == bestMin && fabs(avgClear - bestAvg) < 1e-3f && width > bestWidth) ||
-          (minClearMin == bestMin && fabs(avgClear - bestAvg) < 1e-3f && width == bestWidth && offset < bestOffset)) {
+          (minClearMin == bestMin && fabs(avgClear - bestAvg) < 1e-3f && width == bestWidth &&
+           ((minClearMin >= IDEAL_CLEAR && width >= minPassCols && centerOffset < bestCenterOffset) ||
+            (minClearMin < IDEAL_CLEAR && offset < bestOffset)))) {
         bestMin = minClearMin;
         bestAvg = avgClear;
         bestWidth = width;
         bestOffset = offset;
+        bestCenterOffset = centerOffset;
         bestC = c;
       }
     }
@@ -1779,19 +2058,19 @@ static bool buildPreferredPath(int startRow, int startCol,
     for (int dc = -2; dc <= 2; dc++) {
       int candC = curC + dc;
       if (candC < 0 || candC >= COLS) continue;
-      if (pointCloudGrid[r][candC] != 0) continue;
+      if (isPlanningObstacle(r, candC)) continue;
       if (!checkPathWidth(r, candC, distCm)) continue;
 
       int leftDist = 0;
       for (int c2 = candC - 1; c2 >= 0; c2--) {
-        if (pointCloudGrid[r][c2] != 0) break;
+        if (isPlanningObstacle(r, c2)) break;
         leftDist++;
       }
       if (leftDist == candC) leftDist = COLS;
 
       int rightDist = 0;
       for (int c2 = candC + 1; c2 < COLS; c2++) {
-        if (pointCloudGrid[r][c2] != 0) break;
+        if (isPlanningObstacle(r, c2)) break;
         rightDist++;
       }
       if (rightDist == COLS - candC - 1) rightDist = COLS;
@@ -1847,19 +2126,19 @@ static bool buildMacroPathDirect(int startRow, int startCol,
   for (int r = ROWS - 1; r >= startRow; r--) {
     float distCm = (r + 1) * LAYER_HEIGHT;
     for (int c = 0; c < COLS; c++) {
-      if (pointCloudGrid[r][c] != 0) continue;
+      if (isPlanningObstacle(r, c)) continue;
       if (!checkPathWidth(r, c, distCm)) continue;
 
       int leftDist = 0;
       for (int c2 = c - 1; c2 >= 0; c2--) {
-        if (pointCloudGrid[r][c2] != 0) break;
+        if (isPlanningObstacle(r, c2)) break;
         leftDist++;
       }
       if (leftDist == c) leftDist = COLS;
 
       int rightDist = 0;
       for (int c2 = c + 1; c2 < COLS; c2++) {
-        if (pointCloudGrid[r][c2] != 0) break;
+        if (isPlanningObstacle(r, c2)) break;
         rightDist++;
       }
       if (rightDist == COLS - c - 1) rightDist = COLS;
@@ -1896,7 +2175,7 @@ static bool buildMacroPathDirect(int startRow, int startCol,
     // 段1：直行到 turnRow
     for (int r = startRow + 1; r <= turnRow; r++) {
       float distCm = (r + 1) * LAYER_HEIGHT;
-      if (pointCloudGrid[r][startCol] != 0 || !checkPathWidth(r, startCol, distCm)) {
+      if (isPlanningObstacle(r, startCol) || !checkPathWidth(r, startCol, distCm)) {
         ok = false;
         break;
       }
@@ -1914,7 +2193,7 @@ static bool buildMacroPathDirect(int startRow, int startCol,
         ok = false;
         break;
       }
-      if (pointCloudGrid[curR][curC] != 0 || !checkPathWidth(curR, curC, distCm)) {
+      if (isPlanningObstacle(curR, curC) || !checkPathWidth(curR, curC, distCm)) {
         ok = false;
         break;
       }
@@ -1924,7 +2203,7 @@ static bool buildMacroPathDirect(int startRow, int startCol,
     // 段3：直行到终点行
     for (int r = curR + 1; r <= targetRow; r++) {
       float distCm = (r + 1) * LAYER_HEIGHT;
-      if (pointCloudGrid[r][curC] != 0 || !checkPathWidth(r, curC, distCm)) {
+      if (isPlanningObstacle(r, curC) || !checkPathWidth(r, curC, distCm)) {
         ok = false;
         break;
       }
@@ -2465,6 +2744,16 @@ void updateNavigation() {
     // 检查移动是否完成
     if (wasMoving && !isMoving) {
       delayAfterAction();
+      if (pendingTurnBackStraight) {
+        pendingTurnBackStraight = false;
+        stopMotors();
+        navState = NAV_IDLE;
+        requestStepPause("直行完成");
+        requestReplan("回正后直行完成");
+        setCurrentAction("", 0.0f);
+        wasMoving = false;
+        return;
+      }
       Serial.println("【执行】步骤2完成，节点到达");
       // 推进到下一个航点
       advanceWaypoint();
@@ -2566,11 +2855,14 @@ void updateNavigation() {
         stopMotors();
         if (macroActive && macroPhase == 3) {
           if (REPLAN_AFTER_TURNBACK) {
-            navState = NAV_IDLE;
-            macroActive = false;
+            navForwardDist = TURNBACK_STRAIGHT_CM;
+            navState = NAV_MOVE_TO_ENTRANCE;
+            pendingTurnBackStraight = true;
+            Serial.print("【执行】回正完成，插入直行 ");
+            Serial.print(navForwardDist, 1);
+            Serial.println(" cm");
+            setCurrentAction("line", navForwardDist);
             requestStepPause("回正完成");
-            requestReplan("回正完成");
-            setCurrentAction("", 0.0f);
           } else if (macroStraight3Cm > 0.5f) {
             navForwardDist = macroStraight3Cm;
             navState = NAV_MOVE_TO_ENTRANCE;
@@ -2589,36 +2881,27 @@ void updateNavigation() {
           }
           return;
         }
-        if (pendingBackThenStraight) {
-          pendingBackThenStraight = false;
-          // 尝试在回正后执行一次直行（仅当下一段无需转向）
-          if (loadNextWaypoint() && fabs(navTurnAngle) <= 0.5f) {
-            navTurnAngle = 0.0f;
-            navState = NAV_MOVE_TO_ENTRANCE;
-            setCurrentAction("line", navForwardDist);
-            requestStepPause("回正完成");
-          } else {
-            navState = NAV_IDLE;
-          requestStepPause("回正完成");
-            requestReplan("回正完成");
-            setCurrentAction("", 0.0f);
-          }
-        } else {
-          navState = NAV_IDLE;
+        navForwardDist = TURNBACK_STRAIGHT_CM;
+        navState = NAV_MOVE_TO_ENTRANCE;
+        pendingTurnBackStraight = true;
+        Serial.print("【执行】回正完成，插入直行 ");
+        Serial.print(navForwardDist, 1);
+        Serial.println(" cm");
+        setCurrentAction("line", navForwardDist);
         requestStepPause("回正完成");
-          requestReplan("回正完成");
-          setCurrentAction("", 0.0f);
-        }
       }
     } else {
       delayAfterAction();
       if (macroActive && macroPhase == 3) {
         if (REPLAN_AFTER_TURNBACK) {
-          navState = NAV_IDLE;
-          macroActive = false;
-        requestStepPause("回正完成");
-          requestReplan("回正完成");
-          setCurrentAction("", 0.0f);
+          navForwardDist = TURNBACK_STRAIGHT_CM;
+          navState = NAV_MOVE_TO_ENTRANCE;
+          pendingTurnBackStraight = true;
+          Serial.print("【执行】回正完成，插入直行 ");
+          Serial.print(navForwardDist, 1);
+          Serial.println(" cm");
+          setCurrentAction("line", navForwardDist);
+          requestStepPause("回正完成");
         } else if (macroStraight3Cm > 0.5f) {
           navForwardDist = macroStraight3Cm;
           navState = NAV_MOVE_TO_ENTRANCE;
@@ -2635,24 +2918,15 @@ void updateNavigation() {
           requestReplan("宏路径完成");
           setCurrentAction("", 0.0f);
         }
-      } else if (pendingBackThenStraight) {
-        pendingBackThenStraight = false;
-        if (loadNextWaypoint() && fabs(navTurnAngle) <= 0.5f) {
-          navTurnAngle = 0.0f;
-          navState = NAV_MOVE_TO_ENTRANCE;
-          setCurrentAction("line", navForwardDist);
-          requestStepPause("回正完成");
-        } else {
-          navState = NAV_IDLE;
-        requestStepPause("回正完成");
-          requestReplan("回正完成");
-          setCurrentAction("", 0.0f);
-        }
       } else {
-        navState = NAV_IDLE;
-      requestStepPause("回正完成");
-        requestReplan("回正完成");
-        setCurrentAction("", 0.0f);
+        navForwardDist = TURNBACK_STRAIGHT_CM;
+        navState = NAV_MOVE_TO_ENTRANCE;
+        pendingTurnBackStraight = true;
+        Serial.print("【执行】回正完成，插入直行 ");
+        Serial.print(navForwardDist, 1);
+        Serial.println(" cm");
+        setCurrentAction("line", navForwardDist);
+        requestStepPause("回正完成");
       }
     }
   }
@@ -2865,6 +3139,7 @@ static void requestStepPause(const char* reason) {
   Serial.println(reason);
 }
 
+
 static void computeMacroTurnAndDist(int straightRows, int diagSteps, int diagRows, int startCol, int diagSign,
                                     float& turnDeg, float& diagDistCm) {
   turnDeg = 0.0f;
@@ -2878,9 +3153,9 @@ static void computeMacroTurnAndDist(int straightRows, int diagSteps, int diagRow
 
   int forwardRows = diagRows;
   if (forwardRows <= 0) forwardRows = diagSteps;
-  float forwardCm = forwardRows * LAYER_HEIGHT;
-  float lateralCm = 0.0f;
   int baseRow = straightRows;
+  float forwardCm = forwardRows * LAYER_HEIGHT + LAYER_HEIGHT; // 与终点距离同样强制+5
+  float lateralCm = 0.0f;
   int stepCount = diagSteps;
 
   for (int i = 1; i <= stepCount; i++) {
@@ -2891,7 +3166,7 @@ static void computeMacroTurnAndDist(int straightRows, int diagSteps, int diagRow
   }
 
   float startDistCm = baseRow * LAYER_HEIGHT;
-  float endDistCm = (baseRow + forwardRows) * LAYER_HEIGHT;
+  float endDistCm = (baseRow + forwardRows) * LAYER_HEIGHT + LAYER_HEIGHT;
   float startAngleDeg = -((startCol - CENTER_COL) * ANGLE_STEP);
   float endAngleDeg = -((endCol - CENTER_COL) * ANGLE_STEP);
   float startX = startDistCm * tan(radians(startAngleDeg));
