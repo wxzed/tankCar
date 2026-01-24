@@ -269,6 +269,13 @@ static bool buildPreferredPath(int startRow, int startCol,
 static bool buildMacroPathDirect(int startRow, int startCol,
                                  int parentR[ROWS][COLS], int parentC[ROWS][COLS],
                                  int& endR, int& endC);
+static bool detectCollisionNarrow();
+static bool detectCollisionWide();
+static void enterSearchMode(SearchReason reason, const char* logMessage);
+static void handleTurnToGap();
+static void handleMoveToEntrance();
+static void handleTurnBack();
+static void handleSearch();
 
 /*
  * 调试：打印当前帧 zValues 的统计信息和部分列值
@@ -2001,275 +2008,207 @@ void navigateToGap() {
   }
 }
 
-/*
- * 更新导航状态机（需要在主循环中持续调用）
- */
-void updateNavigation() {
-  // 状态变更时打印一次（简化版）
-  if (navState != lastLoggedNavState) {
-    lastLoggedNavState = navState;
-  }
+static bool detectCollisionNarrow() {
+  const int COLLISION_THRESHOLD_MM = 150; // 15cm = 150mm
+  int centerStart = TOTAL_POINTS / 2 - TOTAL_POINTS / 12;  // 中心减去1/12
+  int centerEnd = TOTAL_POINTS / 2 + TOTAL_POINTS / 12 - 1;  // 中心加上1/12（中间1/6的列）
+  return checkCollisionRisk(COLLISION_THRESHOLD_MM, centerStart, centerEnd);
+}
 
-  // 如果电机未启用，直接停止并请求重规划
-  if (motorDriveState != MOTOR_DRIVE_ENABLED &&
-      navState != NAV_IDLE &&
-      navState != NAV_SEARCHING) {
-    stopMotors();
-    navState = NAV_IDLE;
-    requestReplan("电机未启用");
+static bool detectCollisionWide() {
+  const int COLLISION_THRESHOLD_MM = 150; // 15cm = 150mm
+  int centerStart = TOTAL_POINTS / 4;  // 从1/4处开始
+  int centerEnd = TOTAL_POINTS * 3 / 4 - 1;  // 到3/4处结束（中间一半的列）
+  return checkCollisionRisk(COLLISION_THRESHOLD_MM, centerStart, centerEnd);
+}
+
+static void enterSearchMode(SearchReason reason, const char* logMessage) {
+  if (logMessage != nullptr && strlen(logMessage) > 0) {
+    Serial.println(logMessage);
+  }
+  stopMotors();
+  navState = NAV_SEARCHING; // 进入搜索模式
+  searchStep = 0;
+  searchTotalAngle = 0.0f; // 重置累计角度
+  currentSearchReason = reason; // 设置搜索原因
+}
+
+static void handleTurnToGap() {
+  if (detectCollisionNarrow()) {
+    enterSearchMode(SEARCH_COLLISION, "【警告】转向中检测到近距离障碍物，进入搜索模式！");
     return;
   }
 
-  if (stepPauseActive) {
-    return;
+  if (navTurnAngle < 0) {
+    setCurrentAction("left", abs(navTurnAngle));
+    turnLeft(abs(navTurnAngle));
+  } else {
+    setCurrentAction("right", navTurnAngle);
+    turnRight(navTurnAngle);
   }
 
-  // 持续调用电机控制函数，让它们检查状态并完成动作
-  if (navState == NAV_TURN_TO_GAP) {
-    // 实时碰撞检测：即使在转向过程中也检测
-    // 只检测中间列（正前方），避免侧边障碍物误判
-    // 检测范围：中间1/6的列（很小的范围，只关注正中心）
-    const int COLLISION_THRESHOLD_MM = 150; // 15cm = 150mm
-    int centerStart = TOTAL_POINTS / 2 - TOTAL_POINTS / 12;  // 中心减去1/12
-    int centerEnd = TOTAL_POINTS / 2 + TOTAL_POINTS / 12 - 1;  // 中心加上1/12（中间1/6的列）
-    if (checkCollisionRisk(COLLISION_THRESHOLD_MM, centerStart, centerEnd)) {
-      Serial.println("【警告】转向中检测到近距离障碍物，进入搜索模式！");
-      stopMotors();
-      navState = NAV_SEARCHING; // 进入搜索模式
-      searchStep = 0;
-      searchTotalAngle = 0.0; // 重置累计角度
-      currentSearchReason = SEARCH_COLLISION; // 设置搜索原因：障碍物
-      // 屏幕显示会在主循环的updateDisplay()中自动更新
-      return;
-    }
-    
-    // 持续调用转向函数，让它检查时间并完成转向
-    if (navTurnAngle < 0) {
-      setCurrentAction("left", abs(navTurnAngle));
-      turnLeft(abs(navTurnAngle));
-    } else {
-      setCurrentAction("right", navTurnAngle);
-      turnRight(navTurnAngle);
-    }
-    // 检查转向是否完成
-    if (!isTurning) {
-      delayAfterAction();
-      if (macroActive && macroPhase == 1) {
-        navForwardDist = macroDiagDistCm;
-        navState = NAV_MOVE_TO_ENTRANCE;
-        macroPhase = 2;
-        Serial.print("【执行】宏路径: 直行 ");
-        Serial.print(macroDiagDistCm, 1);
-        Serial.println(" cm");
-        setCurrentAction("line", navForwardDist);
-        requestStepPause("转向完成");
-        return;
-      } else {
-        Serial.print("【执行】步骤1完成，步骤2: 直行 ");
-        Serial.print(navForwardDist, 1);
-        Serial.println(" cm");
-        navState = NAV_MOVE_TO_ENTRANCE;
-        setCurrentAction("line", navForwardDist);
-        requestStepPause("转向完成");
-        return;
-      }
-      // 确保移动标志已重置，准备启动前进
-      if (isMoving) {
-        stopMotors();
-        delay(50);
-      }
-    }
-  }
-  else if (navState == NAV_MOVE_TO_ENTRANCE) {
-    static bool wasMoving = false;
-    
-    // 实时碰撞检测：在前进到入口过程中检测
-    // 只检测中间列（正前方），避免侧边障碍物误判
-    // 检测范围：中间1/6的列（很小的范围，只关注正中心）
-    const int COLLISION_THRESHOLD_MM = 150; // 15cm = 150mm
-    int centerStart = TOTAL_POINTS / 2 - TOTAL_POINTS / 12;  // 中心减去1/12
-    int centerEnd = TOTAL_POINTS / 2 + TOTAL_POINTS / 12 - 1;  // 中心加上1/12（中间1/6的列）
-    if (checkCollisionRisk(COLLISION_THRESHOLD_MM, centerStart, centerEnd)) {
-      Serial.println("【警告】前进中检测到近距离障碍物，进入搜索模式！");
-      stopMotors();
-      navState = NAV_SEARCHING; // 进入搜索模式
-      searchStep = 0;
-      searchTotalAngle = 0.0; // 重置累计角度
-      currentSearchReason = SEARCH_COLLISION; // 设置搜索原因：障碍物
-      // 屏幕显示会在主循环的updateDisplay()中自动更新
-      wasMoving = false;
-      return;
-    }
-
-    // 行进中尝试重规划（使用最新点云），平滑模式：不强制急停
-    // 宏路径执行中不动态重规划，避免中途被打断
-    if (!macroActive && tryReplanAndSwitchPath(false)) {
-      Serial.println("【动态重规划】使用新路径，重新执行");
-      return;
-    }
-    
-    // 只在没有移动时才启动新的移动，避免重复启动
-    if (!isMoving && !wasMoving) {
+  if (!isTurning) {
+    delayAfterAction();
+    if (macroActive && macroPhase == 1) {
+      navForwardDist = macroDiagDistCm;
+      navState = NAV_MOVE_TO_ENTRANCE;
+      macroPhase = 2;
+      Serial.print("【执行】宏路径: 直行 ");
+      Serial.print(macroDiagDistCm, 1);
+      Serial.println(" cm");
       setCurrentAction("line", navForwardDist);
-      moveForwardDistance(navForwardDist);
-      if (isMoving) {
-        wasMoving = true;
-      }
-    } else if (isMoving) {
-      moveDistance(navForwardDist);
+      requestStepPause("转向完成");
+      return;
+    }
+
+    Serial.print("【执行】步骤1完成，步骤2: 直行 ");
+    Serial.print(navForwardDist, 1);
+    Serial.println(" cm");
+    navState = NAV_MOVE_TO_ENTRANCE;
+    setCurrentAction("line", navForwardDist);
+    requestStepPause("转向完成");
+  }
+}
+
+static void handleMoveToEntrance() {
+  static bool wasMoving = false;
+
+  if (detectCollisionNarrow()) {
+    enterSearchMode(SEARCH_COLLISION, "【警告】前进中检测到近距离障碍物，进入搜索模式！");
+    wasMoving = false;
+    return;
+  }
+
+  // 行进中尝试重规划（使用最新点云），平滑模式：不强制急停
+  // 宏路径执行中不动态重规划，避免中途被打断
+  if (!macroActive && tryReplanAndSwitchPath(false)) {
+    Serial.println("【动态重规划】使用新路径，重新执行");
+    return;
+  }
+
+  // 只在没有移动时才启动新的移动，避免重复启动
+  if (!isMoving && !wasMoving) {
+    setCurrentAction("line", navForwardDist);
+    moveForwardDistance(navForwardDist);
+    if (isMoving) {
       wasMoving = true;
     }
-    
-    // 检查移动是否完成
-    if (wasMoving && !isMoving) {
-      delayAfterAction();
-      if (pendingTurnBackStraight) {
-        pendingTurnBackStraight = false;
-        stopMotors();
-        navState = NAV_IDLE;
-        requestStepPause("直行完成");
-        requestReplan("回正后直行完成");
-        setCurrentAction("", 0.0f);
-        wasMoving = false;
-        return;
-      }
-      Serial.println("【执行】步骤2完成，节点到达");
-      // 推进到下一个航点
-      advanceWaypoint();
+  } else if (isMoving) {
+    moveDistance(navForwardDist);
+    wasMoving = true;
+  }
+
+  if (wasMoving && !isMoving) {
+    delayAfterAction();
+    if (pendingTurnBackStraight) {
+      pendingTurnBackStraight = false;
+      stopMotors();
+      navState = NAV_IDLE;
+      requestStepPause("直行完成");
+      requestReplan("回正后直行完成");
+      setCurrentAction("", 0.0f);
       wasMoving = false;
-      executedSegments++;
+      return;
+    }
+    Serial.println("【执行】步骤2完成，节点到达");
+    // 推进到下一个航点
+    advanceWaypoint();
+    wasMoving = false;
+    executedSegments++;
 
-      if (macroActive) {
-        if (macroPhase == 0) {
-          // 完成直行1
-          if (fabs(macroTurnDeg) > 0.5f) {
-            navTurnAngle = macroTurnDeg;
-            navState = NAV_TURN_TO_GAP;
-            macroPhase = 1;
-            Serial.print("【执行】宏路径: ");
-            Serial.print(macroTurnDeg < 0 ? "左转 " : "右转 ");
-            Serial.print(fabs(macroTurnDeg), 1);
-            Serial.println(" 度");
-            setCurrentAction(macroTurnDeg < 0 ? "left" : "right", fabs(macroTurnDeg));
-            requestStepPause("直行完成");
-            return;
-          } else {
-            navForwardDist = macroStraight3Cm;
-            navState = NAV_MOVE_TO_ENTRANCE;
-            macroPhase = 4;
-            Serial.print("【执行】宏路径: 直行 ");
-            Serial.print(macroStraight3Cm, 1);
-            Serial.println(" cm");
-            setCurrentAction("line", navForwardDist);
-            requestStepPause("直行完成");
-            return;
-          }
-        } else if (macroPhase == 2) {
-          // 完成直行2
-          navTurnBackAngle = -macroTurnDeg;
-          navState = NAV_TURN_BACK;
-          macroPhase = 3;
+    if (macroActive) {
+      if (macroPhase == 0) {
+        // 完成直行1
+        if (fabs(macroTurnDeg) > 0.5f) {
+          navTurnAngle = macroTurnDeg;
+          navState = NAV_TURN_TO_GAP;
+          macroPhase = 1;
           Serial.print("【执行】宏路径: ");
-          Serial.print(macroTurnDeg > 0 ? "左转 " : "右转 ");
+          Serial.print(macroTurnDeg < 0 ? "左转 " : "右转 ");
           Serial.print(fabs(macroTurnDeg), 1);
-          Serial.println(" 度 (侧移后回正)");
-          setCurrentAction(macroTurnDeg > 0 ? "left" : "right", fabs(macroTurnDeg));
+          Serial.println(" 度");
+          setCurrentAction(macroTurnDeg < 0 ? "left" : "right", fabs(macroTurnDeg));
           requestStepPause("直行完成");
           return;
-        } else if (macroPhase == 4) {
-          // 完成直行3
-          stopMotors();
-          navState = NAV_IDLE;
-          macroActive = false;
-          requestReplan("宏路径完成");
-          setCurrentAction("", 0.0f);
-          return;
-        }
-      }
-
-      // 每帧只执行有限航段，执行完后回正再重新规划
-      const int MAX_SEGMENTS_PER_CYCLE = 2; // 尽量形成“直行-转向-直行-回正-直行”节奏
-      if (executedSegments >= MAX_SEGMENTS_PER_CYCLE) {
-        if (fabs(lastSegmentTurnAngle) > 0.5f) {
-          navTurnBackAngle = -lastSegmentTurnAngle;
-          navState = NAV_TURN_BACK;
-          requestStepPause("直行完成");
         } else {
-          stopMotors();
-          navState = NAV_IDLE;
-          requestReplan("本轮航段完成");
+          navForwardDist = macroStraight3Cm;
+          navState = NAV_MOVE_TO_ENTRANCE;
+          macroPhase = 4;
+          Serial.print("【执行】宏路径: 直行 ");
+          Serial.print(macroStraight3Cm, 1);
+          Serial.println(" cm");
+          setCurrentAction("line", navForwardDist);
+          requestStepPause("直行完成");
+          return;
         }
+      } else if (macroPhase == 2) {
+        // 完成直行2
+        navTurnBackAngle = -macroTurnDeg;
+        navState = NAV_TURN_BACK;
+        macroPhase = 3;
+        Serial.print("【执行】宏路径: ");
+        Serial.print(macroTurnDeg > 0 ? "左转 " : "右转 ");
+        Serial.print(fabs(macroTurnDeg), 1);
+        Serial.println(" 度 (侧移后回正)");
+        setCurrentAction(macroTurnDeg > 0 ? "left" : "right", fabs(macroTurnDeg));
+        requestStepPause("直行完成");
         return;
-      }
-
-      // 判断是否还有后续航段
-      if (waypointIndex >= waypointCount) {
+      } else if (macroPhase == 4) {
+        // 完成直行3
         stopMotors();
         navState = NAV_IDLE;
-        requestReplan("路径完成(本轮)");
+        macroActive = false;
+        requestReplan("宏路径完成");
+        setCurrentAction("", 0.0f);
+        return;
+      }
+    }
+
+    // 每帧只执行有限航段，执行完后回正再重新规划
+    const int MAX_SEGMENTS_PER_CYCLE = 2; // 尽量形成“直行-转向-直行-回正-直行”节奏
+    if (executedSegments >= MAX_SEGMENTS_PER_CYCLE) {
+      if (fabs(lastSegmentTurnAngle) > 0.5f) {
+        navTurnBackAngle = -lastSegmentTurnAngle;
+        navState = NAV_TURN_BACK;
+        requestStepPause("直行完成");
       } else {
-        // 装载下一段
-        if (loadNextWaypoint()) {
-          navState = NAV_TURN_TO_GAP;
-          requestStepPause("直行完成");
-          return;
-        } else {
-          navState = NAV_IDLE;
-          pathCompleted = true;
-        }
+        stopMotors();
+        navState = NAV_IDLE;
+        requestReplan("本轮航段完成");
+      }
+      return;
+    }
+
+    // 判断是否还有后续航段
+    if (waypointIndex >= waypointCount) {
+      stopMotors();
+      navState = NAV_IDLE;
+      requestReplan("路径完成(本轮)");
+    } else {
+      // 装载下一段
+      if (loadNextWaypoint()) {
+        navState = NAV_TURN_TO_GAP;
+        requestStepPause("直行完成");
+        return;
+      } else {
+        navState = NAV_IDLE;
+        pathCompleted = true;
       }
     }
   }
-  else if (navState == NAV_TURN_BACK) {
-    if (fabs(navTurnBackAngle) > 0.5f) {
-      setCurrentAction(navTurnBackAngle < 0 ? "left" : "right", fabs(navTurnBackAngle));
-      if (navTurnBackAngle < 0) {
-        turnLeft(abs(navTurnBackAngle));
-      } else {
-        turnRight(navTurnBackAngle);
-      }
-      if (!isTurning) {
-        delayAfterAction();
-        stopMotors();
-        if (macroActive && macroPhase == 3) {
-          if (REPLAN_AFTER_TURNBACK) {
-            navForwardDist = TURNBACK_STRAIGHT_CM;
-            navState = NAV_MOVE_TO_ENTRANCE;
-            pendingTurnBackStraight = true;
-            Serial.print("【执行】回正完成，插入直行 ");
-            Serial.print(navForwardDist, 1);
-            Serial.println(" cm");
-            setCurrentAction("line", navForwardDist);
-            requestStepPause("回正完成");
-          } else if (macroStraight3Cm > 0.5f) {
-            navForwardDist = macroStraight3Cm;
-            navState = NAV_MOVE_TO_ENTRANCE;
-            macroPhase = 4;
-            Serial.print("【执行】宏路径: 直行 ");
-            Serial.print(macroStraight3Cm, 1);
-            Serial.println(" cm");
-            setCurrentAction("line", navForwardDist);
-            requestStepPause("回正完成");
-          } else {
-            navState = NAV_IDLE;
-            macroActive = false;
-            requestStepPause("回正完成");
-            requestReplan("宏路径完成");
-            setCurrentAction("", 0.0f);
-          }
-          return;
-        }
-        navForwardDist = TURNBACK_STRAIGHT_CM;
-        navState = NAV_MOVE_TO_ENTRANCE;
-        pendingTurnBackStraight = true;
-        Serial.print("【执行】回正完成，插入直行 ");
-        Serial.print(navForwardDist, 1);
-        Serial.println(" cm");
-        setCurrentAction("line", navForwardDist);
-        requestStepPause("回正完成");
-      }
+}
+
+static void handleTurnBack() {
+  if (fabs(navTurnBackAngle) > 0.5f) {
+    setCurrentAction(navTurnBackAngle < 0 ? "left" : "right", fabs(navTurnBackAngle));
+    if (navTurnBackAngle < 0) {
+      turnLeft(abs(navTurnBackAngle));
     } else {
+      turnRight(navTurnBackAngle);
+    }
+    if (!isTurning) {
       delayAfterAction();
+      stopMotors();
       if (macroActive && macroPhase == 3) {
         if (REPLAN_AFTER_TURNBACK) {
           navForwardDist = TURNBACK_STRAIGHT_CM;
@@ -2292,11 +2231,25 @@ void updateNavigation() {
         } else {
           navState = NAV_IDLE;
           macroActive = false;
-        requestStepPause("回正完成");
+          requestStepPause("回正完成");
           requestReplan("宏路径完成");
           setCurrentAction("", 0.0f);
         }
-      } else {
+        return;
+      }
+      navForwardDist = TURNBACK_STRAIGHT_CM;
+      navState = NAV_MOVE_TO_ENTRANCE;
+      pendingTurnBackStraight = true;
+      Serial.print("【执行】回正完成，插入直行 ");
+      Serial.print(navForwardDist, 1);
+      Serial.println(" cm");
+      setCurrentAction("line", navForwardDist);
+      requestStepPause("回正完成");
+    }
+  } else {
+    delayAfterAction();
+    if (macroActive && macroPhase == 3) {
+      if (REPLAN_AFTER_TURNBACK) {
         navForwardDist = TURNBACK_STRAIGHT_CM;
         navState = NAV_MOVE_TO_ENTRANCE;
         pendingTurnBackStraight = true;
@@ -2305,129 +2258,156 @@ void updateNavigation() {
         Serial.println(" cm");
         setCurrentAction("line", navForwardDist);
         requestStepPause("回正完成");
+      } else if (macroStraight3Cm > 0.5f) {
+        navForwardDist = macroStraight3Cm;
+        navState = NAV_MOVE_TO_ENTRANCE;
+        macroPhase = 4;
+        Serial.print("【执行】宏路径: 直行 ");
+        Serial.print(macroStraight3Cm, 1);
+        Serial.println(" cm");
+        setCurrentAction("line", navForwardDist);
+        requestStepPause("回正完成");
+      } else {
+        navState = NAV_IDLE;
+        macroActive = false;
+        requestStepPause("回正完成");
+        requestReplan("宏路径完成");
+        setCurrentAction("", 0.0f);
       }
+    } else {
+      navForwardDist = TURNBACK_STRAIGHT_CM;
+      navState = NAV_MOVE_TO_ENTRANCE;
+      pendingTurnBackStraight = true;
+      Serial.print("【执行】回正完成，插入直行 ");
+      Serial.print(navForwardDist, 1);
+      Serial.println(" cm");
+      setCurrentAction("line", navForwardDist);
+      requestStepPause("回正完成");
     }
   }
-  else if (navState == NAV_MOVE_THROUGH) {
-    // 新规划不使用，防御留空
+}
+
+static void handleSearch() {
+  // 搜索模式：单方向连续旋转搜索可走路径
+  // searchStep: 0=旋转, 1=检测, 2=旋转, 3=检测...
+  // 每次旋转固定角度（searchAngleStep），累计旋转角度不超过maxSearchAngle
+
+  if (abs(searchTotalAngle) >= maxSearchAngle) {
+    Serial.println("【搜索模式】已搜索一圈，重新开始搜索...");
+    searchStep = 0;
+    searchTotalAngle = 0.0;
+    delay(500);
   }
-  else if (navState == NAV_SEARCHING) {
-    // 搜索模式：单方向连续旋转搜索可走路径
-    // searchStep: 0=旋转, 1=检测, 2=旋转, 3=检测...
-    // 每次旋转固定角度（searchAngleStep），累计旋转角度不超过maxSearchAngle
-    
-    // 检查是否超过最大搜索角度
-    if (abs(searchTotalAngle) >= maxSearchAngle) {
-      // 已经旋转了一圈，重新开始搜索
-      Serial.println("【搜索模式】已搜索一圈，重新开始搜索...");
-      searchStep = 0;
-      searchTotalAngle = 0.0;
-      delay(500); // 短暂停顿后重新开始
-    }
-    
-    // 偶数步骤：执行旋转
-    if (searchStep % 2 == 0) {
-      // 只在没有旋转时才启动新的旋转，避免重复启动
-      static bool rotationStarted = false;
-      if (!isTurning && !rotationStarted) {
-        Serial.print("【搜索模式】");
-        if (searchDirectionLeft) {
-          Serial.print("左转 ");
-        } else {
-          Serial.print("右转 ");
-        }
-        Serial.print(searchAngleStep, 1);
-        Serial.print(" 度 (累计: ");
-        Serial.print(searchTotalAngle, 1);
-        Serial.println(" 度)");
-        
-        if (searchDirectionLeft) {
-          turnLeft(searchAngleStep);
-          searchTotalAngle += searchAngleStep; // 累计角度
-        } else {
-          turnRight(searchAngleStep);
-          searchTotalAngle += searchAngleStep; // 累计角度
-        }
-        rotationStarted = true;
-      } else if (isTurning) {
-        // 如果正在旋转，持续调用转向函数让它检查时间
-        if (searchDirectionLeft) {
-          turnLeft(searchAngleStep);
-        } else {
-          turnRight(searchAngleStep);
-        }
+
+  if (searchStep % 2 == 0) {
+    static bool rotationStarted = false;
+    if (!isTurning && !rotationStarted) {
+      Serial.print("【搜索模式】");
+      if (searchDirectionLeft) {
+        Serial.print("左转 ");
+      } else {
+        Serial.print("右转 ");
       }
-      
-      // 检查旋转是否完成
-      if (rotationStarted && !isTurning) {
-        // 旋转完成，进入检测步骤
-        searchStep++;
-        rotationStarted = false;
-        Serial.println("【搜索模式】旋转完成，等待检测...");
-        // 等待一小段时间让传感器数据稳定
-        delay(300);
+      Serial.print(searchAngleStep, 1);
+      Serial.print(" 度 (累计: ");
+      Serial.print(searchTotalAngle, 1);
+      Serial.println(" 度)");
+
+      if (searchDirectionLeft) {
+        turnLeft(searchAngleStep);
+        searchTotalAngle += searchAngleStep;
+      } else {
+        turnRight(searchAngleStep);
+        searchTotalAngle += searchAngleStep;
+      }
+      rotationStarted = true;
+    } else if (isTurning) {
+      if (searchDirectionLeft) {
+        turnLeft(searchAngleStep);
+      } else {
+        turnRight(searchAngleStep);
       }
     }
-    // 奇数步骤：等待检测（检测在 runGapTest() 中进行）
-    // runGapTest() 会在检测步骤时自动调用并检测
-    // 如果找到空洞，会自动退出搜索模式并开始导航
-    // 如果没找到，等待一段时间后继续下一步搜索
-    else {
-      static unsigned long detectionStartTime = 0;
-      static bool detectionStarted = false;
-      static bool collisionWarningPrinted = false; // 防止重复打印碰撞警告
-      
-      // 初始化检测开始时间
-      if (!detectionStarted) {
-        detectionStartTime = millis();
-        detectionStarted = true;
-        collisionWarningPrinted = false; // 重置警告标志
-        Serial.println("【搜索模式】正在检测当前方向...");
-        // 打印当前地图和z值统计，帮助调试为什么没有找到空洞
+
+    if (rotationStarted && !isTurning) {
+      searchStep++;
+      rotationStarted = false;
+      Serial.println("【搜索模式】旋转完成，等待检测...");
+      delay(300);
+    }
+  } else {
+    static unsigned long detectionStartTime = 0;
+    static bool detectionStarted = false;
+    static bool collisionWarningPrinted = false;
+
+    if (!detectionStarted) {
+      detectionStartTime = millis();
+      detectionStarted = true;
+      collisionWarningPrinted = false;
+      Serial.println("【搜索模式】正在检测当前方向...");
+      Serial.print("【搜索角度：");
+      Serial.print(searchTotalAngle, 1);
+      Serial.println("度】");
+      printZValuesSummary();
+    }
+
+    if (!collisionWarningPrinted && detectCollisionWide()) {
+      Serial.println("【警告】搜索中检测到近距离障碍物，继续搜索其他方向！");
+      collisionWarningPrinted = true;
+      if (currentSearchReason == SEARCH_NO_GAP) {
+        currentSearchReason = SEARCH_COLLISION;
+      }
+    }
+
+    unsigned long currentTime = millis();
+    if (currentTime - detectionStartTime >= 500) {
+      if (!gapFound) {
         Serial.print("【搜索角度：");
         Serial.print(searchTotalAngle, 1);
-        Serial.println("度】");
+        Serial.println("度 - 未找到空洞】");
         printZValuesSummary();
-      }
-      
-      // 在检测步骤时进行碰撞检测（只检测一次，避免重复打印）
-      // 只检测中间列（正前方），避免侧边障碍物误判
-      const int COLLISION_THRESHOLD_MM = 150; // 15cm = 150mm
-      int centerStart = TOTAL_POINTS / 4;  // 从1/4处开始
-      int centerEnd = TOTAL_POINTS * 3 / 4 - 1;  // 到3/4处结束（中间一半的列）
-      if (!collisionWarningPrinted && checkCollisionRisk(COLLISION_THRESHOLD_MM, centerStart, centerEnd)) {
-        Serial.println("【警告】搜索中检测到近距离障碍物，继续搜索其他方向！");
-        collisionWarningPrinted = true; // 标记已打印，避免重复
-        // 更新搜索原因显示（如果当前是未找到空洞，则更新为障碍物）
-        if (currentSearchReason == SEARCH_NO_GAP) {
-          currentSearchReason = SEARCH_COLLISION;
-          // 屏幕显示会在主循环的updateDisplay()中自动更新
-        }
-        // 不停止搜索，继续尝试其他角度
-      }
-      
-      // 等待至少500ms让 runGapTest() 有时间检测
-      unsigned long currentTime = millis();
-      if (currentTime - detectionStartTime >= 500) {
-        // 检测时间已到，如果还没找到空洞，继续下一步搜索
-        if (!gapFound) {
-          // 打印地图和z值统计，帮助调试为什么没有找到空洞
-          Serial.print("【搜索角度：");
-          Serial.print(searchTotalAngle, 1);
-          Serial.println("度 - 未找到空洞】");
-          printZValuesSummary();
-          
-          searchStep++;
-          detectionStarted = false;
-          collisionWarningPrinted = false; // 重置警告标志，准备下次检测
-          Serial.println("【搜索模式】当前方向未找到合适空洞，继续旋转搜索...");
-        }
-        // 如果找到空洞，gapFound 会被设置为 true，runGapTest() 会处理导航
+
+        searchStep++;
+        detectionStarted = false;
+        collisionWarningPrinted = false;
+        Serial.println("【搜索模式】当前方向未找到合适空洞，继续旋转搜索...");
       }
     }
   }
-  else if (navState == NAV_IDLE) {
-    // 空闲状态，什么都不做
+}
+
+/*
+ * 更新导航状态机（需要在主循环中持续调用）
+ */
+void updateNavigation() {
+  if (navState != lastLoggedNavState) {
+    lastLoggedNavState = navState;
+  }
+
+  // 如果电机未启用，直接停止并请求重规划
+  if (motorDriveState != MOTOR_DRIVE_ENABLED &&
+      navState != NAV_IDLE &&
+      navState != NAV_SEARCHING) {
+    stopMotors();
+    navState = NAV_IDLE;
+    requestReplan("电机未启用");
+    return;
+  }
+
+  if (stepPauseActive) {
+    return;
+  }
+
+  if (navState == NAV_TURN_TO_GAP) {
+    handleTurnToGap();
+  } else if (navState == NAV_MOVE_TO_ENTRANCE) {
+    handleMoveToEntrance();
+  } else if (navState == NAV_TURN_BACK) {
+    handleTurnBack();
+  } else if (navState == NAV_SEARCHING) {
+    handleSearch();
+  } else {
+    // NAV_IDLE / NAV_MOVE_THROUGH 无动作
   }
 }
 
