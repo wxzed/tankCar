@@ -67,6 +67,7 @@ static bool macroPlanValid = false;
 static bool macroActive = false;
 static int macroPhase = 0; // 0=直行1,1=转向,2=直行2,3=回正,4=直行3
 static bool stepPauseActive = false; // 步进暂停：每步完成后等待按键继续
+static bool stepPauseEnabled = true; // 步进模式总开关
 static float macroStraight1Cm = 0.0f;
 static float macroDiagDistCm = 0.0f;
 static float macroStraight3Cm = 0.0f;
@@ -75,6 +76,7 @@ static const bool REPLAN_AFTER_TURNBACK = true; // 回正后立即重规划，�
 static char currentAction[10] = ""; // 当前执行动作：left/right/line
 static float currentActionValue = 0.0f;
 static const unsigned long ACTION_STEP_DELAY_MS = 250; // 每步完成后停顿，便于观察
+static const float MAX_INITIAL_STRAIGHT_CM = 40.0f; // 仅在“纯直行开局”时限制
 
 // 搜索模式相关变量
 static int searchStep = 0;  // 搜索步骤：0=旋转, 1=检测, 2=旋转, 3=检测...
@@ -434,6 +436,14 @@ void runGapTest()  {
     int startCol = waypointCols[0];
     computeMacroTurnAndDist(straightRows, diagSteps, diagRows, startCol, diagSign,
                             macroTurnDeg, macroDiagDistCm);
+    if (fabs(macroTurnDeg) <= 0.5f && macroStraight1Cm > MAX_INITIAL_STRAIGHT_CM) {
+      Serial.print("【直行上限】纯直行开局，距离 ");
+      Serial.print(macroStraight1Cm, 1);
+      Serial.print(" cm，限制为 ");
+      Serial.print(MAX_INITIAL_STRAIGHT_CM, 1);
+      Serial.println(" cm");
+      macroStraight1Cm = MAX_INITIAL_STRAIGHT_CM;
+    }
   } else {
     macroPlanValid = false;
   }
@@ -2483,14 +2493,29 @@ bool isStepPauseActive() {
   return stepPauseActive;
 }
 
+bool isStepPauseModeEnabled() {
+  return stepPauseEnabled;
+}
+
 void resumeStepPause() {
   if (!stepPauseActive) return;
   stepPauseActive = false;
   Serial.println("【继续】按键继续执行");
 }
 
+void toggleStepPauseMode() {
+  stepPauseEnabled = !stepPauseEnabled;
+  if (!stepPauseEnabled) {
+    stepPauseActive = false;
+    Serial.println("【步进模式】已关闭，连续运行");
+  } else {
+    Serial.println("【步进模式】已开启，逐步执行");
+  }
+}
+
 static void requestStepPause(const char* reason) {
   if (motorDriveState != MOTOR_DRIVE_ENABLED) return;
+  if (!stepPauseEnabled) return;
   stepPauseActive = true;
   stopMotors();
   Serial.print("【暂停】");

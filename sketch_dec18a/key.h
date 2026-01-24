@@ -3,6 +3,7 @@
 
 // 定义按键引脚
 #define KEY_PIN 8
+#define MODE_KEY_PIN 45
 
 // 定义按键检测相关参数
 #define KEY_DEBOUNCE_TIME 10  // 按键消抖时间，单位：毫秒
@@ -27,6 +28,7 @@ void keyInit(void);
  * @return bool 按键是否被按下（已消抖）
  */
 bool keyCheck(void);
+bool modeKeyCheck(void);
 
 /**
  * @brief 切换电机驱动状态

@@ -30,5 +30,7 @@ int getPlannedStepsForDisplay(char steps[][10], float values[], int maxSteps);
 // 步进暂停控制（电机启用时每步执行完暂停，按键继续）
 bool isStepPauseActive();
 void resumeStepPause();
+bool isStepPauseModeEnabled();
+void toggleStepPauseMode();
 
 #endif

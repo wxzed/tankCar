@@ -191,6 +191,12 @@ void setup() {
 void loop() {
 
   updateDisplay();
+  if (modeKeyCheck()) {
+    toggleStepPauseMode();
+    if (!isStepPauseModeEnabled()) {
+      resumeStepPause();
+    }
+  }
   if (isStepPauseActive()) {
     if (keyCheck()) {
       resumeStepPause();
