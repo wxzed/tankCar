@@ -24,36 +24,11 @@ const float ANGLE_STEP = 2.4;  // 每点角度间隔（度）
 const float LAYER_HEIGHT = 5.0; // 每层高度间隔（cm）
 const float CAR_WIDTH = 20.0;   // 车身宽度（cm）- 根据实际小车尺寸修改
 const float CENTER_COL = (COLS - 1) / 2.0; // 中心列索引（15.5）
-const int MIN_LAYERS_FOR_GAP = 5; // 空洞必须至少在这几层都存在才认为是有效空洞
-const int START_LAYER = 0;        // 开始分析的层数（0表示从第一层开始）
-const float MIN_GAP_EXTRA_DEPTH = 30.0; // 洞口后的最小有效深度（cm），不足则放弃该空洞
-const float MIN_GAP_DEPTH = 40.0; // 最小空洞深度（cm），如果小于此值，尝试角度微调寻找更深的空洞
-const float MIN_BACK_DEPTH = 10.0; // 洞口后方最小可接受深度（cm），不足则放弃该空洞
-const float ANGLE_ADJUST_STEP = 10.0; // 角度微调步长（度），左右各尝试这个角度
-const int MAX_ANGLE_ADJUSTMENTS = 2; // 最大角度微调次数（左右各几次）
 #ifndef PI
 #define PI 3.14159265358979323846
 #endif
 
-// 空洞结构体
-struct Gap {
-  int startCol;      // 起始列
-  int endCol;        // 结束列
-  int width;         // 宽度（列数）
-  int totalArea;     // 总面积（所有层的空洞点数）
-  float centerAngle; // 中心角度（度）
-  float actualWidth; // 实际物理宽度（cm）- 在最远层的宽度
-  float distance;    // 距离（cm）- 最远层的距离
-  int maxRow;        // 空洞延伸到的最大层数
-  int entranceRow;   // 洞口入口行（两边开始有障碍物的行）
-  float entranceDist; // 洞口入口距离（cm）
-  int leftObstacleRow;  // 左边障碍物开始的行
-  int rightObstacleRow; // 右边障碍物开始的行
-  float tiltAngle;     // 洞口倾斜角度（度），正数表示右边高，负数表示左边高
-};
-
 // 全局变量
-Gap maxGap;
 bool gapFound = false;
 
 // 路径地图（用于标记路径，2表示路径）
@@ -62,11 +37,9 @@ int pathMap[ROWS][COLS];
 // 导航状态机（枚举定义在头文件中）
 NavigationState navState = NAV_IDLE;
 float navForwardDist = 0.0;  // 到洞口入口的距离
-float navThroughGapDist = 0.0;  // 通过空洞到洞底的距离
 float navTurnAngle = 0.0;
 float navTurnBackAngle = 0.0;
 static NavigationState lastLoggedNavState = NAV_IDLE; // 调试：记录上一次打印的状态
-static bool moveToEntranceStarted = false; // 标记是否已经启动了前进到入口的动作
 static bool pathCompleted = false; // 标记路径是否刚完成，需要在重新检测前延时
 static const unsigned long REPLAN_DELAY_MS = 200; // 重新规划前的短暂停顿
 
@@ -76,7 +49,6 @@ static int  goalRow = -1;
 static int  goalCol = -1;
 static float plannedHeadingDeg = 0.0f;
 static float plannedDistanceCm = 0.0f;
-static float plannedPathLengthCm = 0.0f;
 static int preferredCols[ROWS]; // 每行偏好列（尽量走更宽裕的通道）
 // 路径跟随：存储规划出的路径节点（行、列），以及执行进度
 static int waypointRows[ROWS * COLS];
@@ -89,7 +61,6 @@ static int executedSegments = 0;           // 每帧最多执行的航段数计�
 static float lastSegmentTurnAngle = 0.0f;  // 最近航段的转向角
 static bool pendingReplanLog = false;
 static const char* pendingReplanReason = "";
-static bool pendingBackThenStraight = false; // 回正后是否再执行一次直行
 static bool pendingTurnBackStraight = false; // 回正后插入一次直行，再重规划
 static const float TURNBACK_STRAIGHT_CM = 20.0f;
 static bool macroPlanValid = false;
@@ -100,7 +71,6 @@ static float macroStraight1Cm = 0.0f;
 static float macroDiagDistCm = 0.0f;
 static float macroStraight3Cm = 0.0f;
 static float macroTurnDeg = 0.0f;
-static int macroDiagRows = 0;
 static const bool REPLAN_AFTER_TURNBACK = true; // 回正后立即重规划，不再执行最后直行
 static char currentAction[10] = ""; // 当前执行动作：left/right/line
 static float currentActionValue = 0.0f;
@@ -257,11 +227,8 @@ int getPlannedStepsForDisplay(char steps[][10], float values[], int maxSteps) {
   return count;
 }
 
-void findLargestGap();
 void navigateToGap();
-void planAndDisplayPath(); 
 void printPathMap();
-void printExecutionSteps(float startDist, float startAngle, float entranceDist, float entranceAngle, float turnBackAngle, float gapBottomDist);
 void printZValuesSummary(); // 调试：打印z值统计
 // void printCurrentScanMap();  // 调试：直接基于当前zValues生成并打印占据图（暂不打印）
 void fillPointCloudGrid(); // 填充pointCloudGrid数据
@@ -458,8 +425,7 @@ void runGapTest()  {
     macroStraight1Cm = straightRows * LAYER_HEIGHT;
     macroStraight3Cm = straightAfterRows * LAYER_HEIGHT;
     int startCol = waypointCols[0];
-    macroDiagRows = diagRows; // 斜行段按侧移累积行计算
-    computeMacroTurnAndDist(straightRows, diagSteps, macroDiagRows, startCol, diagSign,
+    computeMacroTurnAndDist(straightRows, diagSteps, diagRows, startCol, diagSign,
                             macroTurnDeg, macroDiagDistCm);
   } else {
     macroPlanValid = false;
@@ -470,316 +436,6 @@ void runGapTest()  {
     navigateToGap();
   } else {
     Serial.println("【测试模式】电机未启用，未执行导航");
-  }
-}
-
-/*
- * 计算空洞的实际物理宽度（在最远层）
- * 参数：起始列、结束列、最大层数
- * 返回：实际宽度（cm）
- */
-float calculateActualWidth(int startCol, int endCol, int maxRow) {
-  // 计算空洞的角度范围（度）
-  float angleRange = (endCol - startCol + 1) * ANGLE_STEP;
-  
-  // 计算最远层的距离（cm）
-  float dist = (maxRow + 1) * LAYER_HEIGHT;
-  
-  // 计算实际物理宽度
-  // 使用正弦函数计算：宽度 = 2 * 距离 * sin(角度范围/2)
-  float angleRad = radians(angleRange / 2.0);
-  float actualWidth = 2.0 * dist * sin(angleRad);
-  
-  return actualWidth;
-}
-
-/*
- * 查找空洞的最大延伸层数（连续的空洞层数）
- * 参数：起始列、结束列
- * 返回：最大层数（0-ROWS-1），返回-1表示该列范围内没有完整的空洞
- * 注意：检查从START_LAYER开始，连续多少层该列范围内都是0
- */
-int findMaxRowForGap(int startCol, int endCol) {
-  int maxRow = -1;
-  bool foundObstacle = false;
-  
-  for (int row = START_LAYER; row < ROWS; row++) {
-    // 检查这一层中，指定列范围内的所有列是否都是0
-    bool allZero = true;
-    for (int col = startCol; col <= endCol; col++) {
-      if (pointCloudGrid[row][col] != 0) {
-        allZero = false;
-        foundObstacle = true;
-        break;
-      }
-    }
-    
-    // 只有当所有列都是0时，才认为这一层有空洞
-    if (allZero) {
-      maxRow = row;
-    } else {
-      // 如果遇到障碍物，停止查找（空洞必须是连续的）
-      // 但如果之前已经找到过空洞，就返回之前的结果
-      break;
-    }
-  }
-  
-  return maxRow;
-}
-
-/*
- * 查找左边障碍物开始的行
- * 参数：起始列
- * 返回：左边障碍物开始的行（0-ROWS-1），返回-1表示没有找到
- */
-int findLeftObstacleRow(int startCol) {
-  if (startCol <= 0) return -1;
-  
-  for (int row = START_LAYER; row < ROWS; row++) {
-    if (pointCloudGrid[row][startCol - 1] != 0) {
-      return row;
-    }
-  }
-  return -1;
-}
-
-/*
- * 查找右边障碍物开始的行
- * 参数：结束列
- * 返回：右边障碍物开始的行（0-ROWS-1），返回-1表示没有找到
- */
-int findRightObstacleRow(int endCol) {
-  if (endCol >= COLS - 1) return -1;
-  
-  for (int row = START_LAYER; row < ROWS; row++) {
-    if (pointCloudGrid[row][endCol + 1] != 0) {
-      return row;
-    }
-  }
-  return -1;
-}
-
-/*
- * 查找洞口入口行（两边开始有障碍物的行）
- * 参数：起始列、结束列
- * 返回：洞口入口行（0-ROWS-1），返回-1表示没有找到洞口入口
- * 注意：从START_LAYER开始查找，找到第一个两边有障碍物的行
- */
-int findEntranceRowForGap(int startCol, int endCol) {
-  for (int row = START_LAYER; row < ROWS; row++) {
-    // 检查这一层中，空洞范围内是否都是0
-    bool allZero = true;
-    for (int col = startCol; col <= endCol; col++) {
-      if (pointCloudGrid[row][col] != 0) {
-        allZero = false;
-        break;
-      }
-    }
-    
-    // 如果这一层空洞范围内都是0，检查两边是否有障碍物
-    if (allZero) {
-      // 检查左边是否有障碍物（startCol-1列）
-      bool leftHasObstacle = false;
-      if (startCol > 0 && pointCloudGrid[row][startCol - 1] != 0) {
-        leftHasObstacle = true;
-      }
-      
-      // 检查右边是否有障碍物（endCol+1列）
-      bool rightHasObstacle = false;
-      if (endCol < COLS - 1 && pointCloudGrid[row][endCol + 1] != 0) {
-        rightHasObstacle = true;
-      }
-      
-      // 如果两边都有障碍物，或者至少一边有障碍物，说明这是洞口入口
-      if (leftHasObstacle || rightHasObstacle) {
-        return row;
-      }
-    }
-  }
-  
-  // 如果没找到两边有障碍物的行，返回空洞开始的行（START_LAYER）
-  return START_LAYER;
-}
-
-/*
- * 计算洞口倾斜角度
- * 根据左右两边障碍物开始的行差计算倾斜角度
- * 参数：左边障碍物行、右边障碍物行、空洞中心列
- * 返回：倾斜角度（度），正数表示右边高（需要左转），负数表示左边高（需要右转）
- */
-float calculateGapTiltAngle(int leftRow, int rightRow, float centerCol) {
-  // 如果两边都没有障碍物，返回0（无倾斜）
-  if (leftRow < 0 && rightRow < 0) {
-    return 0.0;
-  }
-  
-  // 如果只有一边有障碍物，无法判断倾斜，返回0
-  if (leftRow < 0 || rightRow < 0) {
-    return 0.0;
-  }
-  
-  // 计算行差（行数越大，距离越远）
-  int rowDiff = rightRow - leftRow;
-  
-  // 如果行差为0，说明洞口是水平的，无倾斜
-  if (rowDiff == 0) {
-    return 0.0;
-  }
-  
-  // 计算左右两边的距离（cm）
-  float leftDist = (leftRow + 1) * LAYER_HEIGHT;
-  float rightDist = (rightRow + 1) * LAYER_HEIGHT;
-  float distDiff = rightDist - leftDist;
-  
-  // 计算空洞的宽度（角度范围对应的物理宽度）
-  // 使用洞口入口的平均距离
-  float avgDist = (leftDist + rightDist) / 2.0;
-  float gapAngleRange = (maxGap.endCol - maxGap.startCol + 1) * ANGLE_STEP;
-  float gapWidthCm = 2.0 * avgDist * sin(radians(gapAngleRange / 2.0));
-  
-  // 计算倾斜角度：atan(高度差/宽度)
-  float tiltAngle = atan(distDiff / gapWidthCm) * 180.0 / PI;
-  
-  // 取反：从小车视角
-  float finalTiltAngle = -tiltAngle;
-  
-  return finalTiltAngle;
-}
-
-/*
- * 检查空洞在指定列范围内，在多少层中存在
- * 参数：起始列、结束列
- * 返回：存在的层数
- */
-int countLayersWithGap(int startCol, int endCol) {
-  int layerCount = 0;
-  for (int row = START_LAYER; row < ROWS; row++) {
-    bool hasGap = true;
-    for (int col = startCol; col <= endCol; col++) {
-      if (pointCloudGrid[row][col] != 0) {
-        hasGap = false;
-        break;
-      }
-    }
-    if (hasGap) {
-      layerCount++;
-    }
-  }
-  return layerCount;
-}
-
-/*
- * 查找最大空洞（宽度大于车身宽度）
- * 算法：枚举所有可能的列范围，检查在多少层中存在，选择最大的
- */
-void findLargestGap() {
-  gapFound = false;
-  maxGap.totalArea = 0;
-  maxGap.actualWidth = 0;
-  
-  // 枚举所有可能的列范围（起始列和结束列）
-  for (int startCol = 0; startCol < COLS; startCol++) {
-    for (int endCol = startCol; endCol < COLS; endCol++) {
-      int width = endCol - startCol + 1;
-      
-      // 检查这个列范围在多少层中存在（完全为空）
-      int layerCount = countLayersWithGap(startCol, endCol);
-      
-      // 只考虑在足够多层都存在的空洞
-      if (layerCount >= MIN_LAYERS_FOR_GAP) {
-        // 查找这个空洞的最大延伸层数
-        int maxRow = findMaxRowForGap(startCol, endCol);
-        
-        if (maxRow >= 0) {
-          // 计算实际物理宽度
-          float actualWidth = calculateActualWidth(startCol, endCol, maxRow);
-          
-          // 只考虑宽度大于车身宽度的空洞
-          if (actualWidth > CAR_WIDTH) {
-            // 计算总面积（所有层中的空洞点数）
-            int totalArea = 0;
-            for (int r = START_LAYER; r <= maxRow; r++) {
-              for (int c = startCol; c <= endCol; c++) {
-                if (pointCloudGrid[r][c] == 0) {
-                  totalArea++;
-                }
-              }
-            }
-            
-            // 优先选择深度最深（maxRow最大）的空洞
-            // 如果深度相同，则选择宽度最大的
-            // 如果深度和宽度都相同，则选择面积最大的
-            bool isBetter = false;
-            if (!gapFound) {
-              isBetter = true;
-            } else if (maxRow > maxGap.maxRow) {
-              // 深度更深，优先选择
-              isBetter = true;
-            } else if (maxRow == maxGap.maxRow) {
-              // 深度相同，选择宽度更大的
-              if (actualWidth > maxGap.actualWidth) {
-                isBetter = true;
-              } else if (actualWidth == maxGap.actualWidth && totalArea > maxGap.totalArea) {
-                // 宽度也相同，选择面积更大的
-                isBetter = true;
-              }
-            }
-            
-            if (isBetter) {
-              maxGap.startCol = startCol;
-              maxGap.endCol = endCol;
-              maxGap.width = width;
-              maxGap.totalArea = totalArea;
-              maxGap.actualWidth = actualWidth;
-              maxGap.maxRow = maxRow;
-              maxGap.distance = (maxRow + 1) * LAYER_HEIGHT;
-              // 查找洞口入口位置
-              maxGap.entranceRow = findEntranceRowForGap(startCol, endCol);
-              
-              // 确保入口行不会大于等于洞底行
-              // 如果入口行大于等于洞底行，使用洞底行减1（或者使用START_LAYER）
-              if (maxGap.entranceRow >= maxRow) {
-                // 如果入口行等于或大于洞底行，说明没有找到合适的入口
-                // 使用洞底行减1，或者使用START_LAYER
-                if (maxRow > 0) {
-                  maxGap.entranceRow = maxRow - 1;  // 使用洞底前一行作为入口
-                } else {
-                  maxGap.entranceRow = START_LAYER;  // 如果洞底就是第一行，使用START_LAYER
-                }
-              }
-              
-              maxGap.entranceDist = (maxGap.entranceRow + 1) * LAYER_HEIGHT;
-              
-              // 洞口后可用深度：洞底距离 - 入口距离
-              float backDepth = maxGap.distance - maxGap.entranceDist;
-              if (backDepth < MIN_BACK_DEPTH) {
-                // 洞口后没有足够深度，放弃这个空洞
-                continue;
-              }
-              // 查找左右障碍物行，用于计算倾斜角度
-              maxGap.leftObstacleRow = findLeftObstacleRow(startCol);
-              maxGap.rightObstacleRow = findRightObstacleRow(endCol);
-              // 计算洞口倾斜角度
-              float gapCenterCol = (startCol + endCol) / 2.0;
-              maxGap.tiltAngle = calculateGapTiltAngle(maxGap.leftObstacleRow, maxGap.rightObstacleRow, gapCenterCol);
-              
-              
-              gapFound = true;
-            }
-          }
-        }
-      }
-    }
-  }
-  
-  // 计算中心角度
-  if (gapFound) {
-    // 中心列（相对于中心点）
-    float centerCol = (maxGap.startCol + maxGap.endCol) / 2.0;
-    // 计算角度：中心列相对于中心点的偏移
-    // 列>16是左边（负角度，左转），列<16是右边（正角度，右转）
-    float offsetFromCenter = centerCol - CENTER_COL;
-    maxGap.centerAngle = -offsetFromCenter * ANGLE_STEP;
   }
 }
 
@@ -1234,7 +890,7 @@ bool planPathWithBFS() {
   plannedHeadingDeg = -offsetCol * ANGLE_STEP;
 
   // 路径长度估算（行步长5cm，斜向乘√2）
-  plannedPathLengthCm = 0.0f;
+  float plannedPathLengthCm = 0.0f;
   int cr = goalRow;
   int cc = goalCol;
   while (!(cr == startRow && cc == startCol)) {
@@ -1372,7 +1028,6 @@ bool loadNextWaypoint() {
   float colOffset = targetCol - currentPoseCol;
   navTurnAngle = -colOffset * ANGLE_STEP;
   navTurnBackAngle = 0.0f;
-  navThroughGapDist = 0.0f;
   plannedHeadingDeg = navTurnAngle;
   plannedDistanceCm = navForwardDist;
   lastSegmentTurnAngle = navTurnAngle;
@@ -1685,32 +1340,6 @@ static bool buildMacroPlan(int& straightRows, int& diagSteps, int& diagRows,
   }
 
   return true;
-}
-
-/*
- * 根据距离和角度计算对应的行列位置
- * 参数：distance - 距离（cm），angle - 角度（度，相对于正前方）
- * 返回：通过引用返回行和列
- */
-void calculatePosition(float distance, float angle, int& row, int& col) {
-  // 计算行（基于距离）
-  // 距离5cm对应第0行，距离10cm对应第1行，以此类推
-  // 公式：row = (distance / LAYER_HEIGHT) - 1
-  row = (int)(distance / LAYER_HEIGHT) - 1;
-  if (row < 0) row = 0;
-  if (row >= ROWS) row = ROWS - 1;
-  
-  // 计算列（基于角度）
-  // 中心列是15.5，角度0度对应中心列
-  // 角度为正（右转）对应列增加（右边），角度为负（左转）对应列减少（左边）
-  // 注意：列<16是右边，列>16是左边
-  float colOffset = angle / ANGLE_STEP;
-  float colFloat = CENTER_COL + colOffset;
-  col = (int)round(colFloat);
-  
-  // 限制在有效范围内
-  if (col < 0) col = 0;
-  if (col >= COLS) col = COLS - 1;
 }
 
 /*
@@ -2242,221 +1871,6 @@ static bool buildMacroPathDirect(int startRow, int startCol,
 }
 
 /*
- * 标记路径上的点（从起点到终点）
- * 参数：startDist - 起点距离（cm），startAngle - 起点角度（度）
- *      endDist - 终点距离（cm），endAngle - 终点角度（度）
- */
-void markPathSegment(float startDist, float startAngle, float endDist, float endAngle) {
-  // 使用插值方法标记路径，确保路径连续
-  // 计算路径上的多个中间点
-  // 根据距离差计算步数，确保每层至少有一个点
-  float distDiff = abs(endDist - startDist);
-  int steps = max(ROWS, (int)(distDiff / LAYER_HEIGHT * 2));  // 每层至少2个点
-  if (steps > 200) steps = 200;  // 最多200个点，避免过度计算
-  
-  // 计算空洞中心列（用于在空洞范围内保持路径在中心）
-  float gapCenterCol = (maxGap.startCol + maxGap.endCol) / 2.0;
-  
-  // 记录已标记的行列组合，用于去重
-  bool marked[ROWS][COLS];
-  for (int r = 0; r < ROWS; r++) {
-    for (int c = 0; c < COLS; c++) {
-      marked[r][c] = false;
-    }
-  }
-  
-  for (int i = 0; i <= steps; i++) {
-    float t = (float)i / (float)steps;
-    float dist = startDist + (endDist - startDist) * t;
-    
-    // 使用角度插值计算路径点
-    float angle = startAngle + (endAngle - startAngle) * t;
-    int row, centerCol;
-    calculatePosition(dist, angle, row, centerCol);
-    
-    // 检查当前距离是否在空洞范围内
-    bool inGapRange = (dist >= maxGap.entranceDist && dist <= maxGap.distance);
-    
-    // 如果在空洞范围内，确保路径在空洞中心列
-    if (inGapRange) {
-      // 强制设置为空洞中心列，确保路径在两边障碍物的中间
-      centerCol = (int)round(gapCenterCol);
-      if (centerCol < 0) centerCol = 0;
-      if (centerCol >= COLS) centerCol = COLS - 1;
-      
-      // 重新计算行（基于距离）
-      row = (int)(dist / LAYER_HEIGHT) - 1;
-      if (row < 0) row = 0;
-      if (row >= ROWS) row = ROWS - 1;
-    }
-    
-    // 检查路径中心点两侧是否有足够空间容纳车身宽度
-    if (!checkPathWidth(row, centerCol, dist)) {
-      // 如果空间不足，跳过这个点（不标记路径）
-      continue;
-    }
-    
-    // 计算车身宽度对应的列范围
-    int startCol, endCol;
-    calculateCarWidthColumns(dist, centerCol, startCol, endCol);
-    
-    // 标记车身宽度范围内的所有点
-    for (int col = startCol; col <= endCol; col++) {
-      if (row >= 0 && row < ROWS && col >= 0 && col < COLS) {
-        // 只标记无障碍物的点，且避免重复标记
-        if (pointCloudGrid[row][col] == 0 && !marked[row][col]) {
-          pathMap[row][col] = 2;
-          marked[row][col] = true;
-        }
-      }
-    }
-  }
-}
-
-/*
- * 规划路径并标记在地图上
- */
-void planAndDisplayPath() {
-  if (!gapFound) return;
-  
-  // 重新初始化路径地图
-  initializePathMap();
-  
-  // 起点：小车当前位置（中心列，距离5cm）
-  float startDist = LAYER_HEIGHT;
-  float startAngle = 0.0;  // 正前方
-  
-  // 计算空洞中心位置和角度（用于路径地图）
-  // 路径地图需要直接使用列偏移，不取反
-  float gapCenterCol = (maxGap.startCol + maxGap.endCol) / 2.0;
-  float gapCenterAngle = (gapCenterCol - CENTER_COL) * ANGLE_STEP;
-  
-  // 分段规划路径：规划到洞底
-  // 步骤1：转向空洞方向
-  // 步骤2：直行到洞口入口
-  // 步骤3：转回正前方（与洞口垂直）
-  // 步骤4：直行通过空洞到洞底
-  float entranceDist = maxGap.entranceDist;
-  float gapBottomDist = maxGap.distance;  // 洞底距离
-  float entranceAngle = gapCenterAngle;  // 路径地图使用这个角度
-  
-  // 标记到洞口入口的路径
-  markPathSegment(startDist, startAngle, entranceDist, entranceAngle);
-  
-  // 标记通过空洞到洞底的路径（转回正前方后，角度为0）
-  markPathSegment(entranceDist, 0.0, gapBottomDist, 0.0);
-  
-  // 计算转回角度：转到与洞口垂直的方向（考虑倾斜角度）
-  // 转回角度 = -entranceAngle + tiltAngle
-  float executionTurnBackAngle = -maxGap.centerAngle - maxGap.tiltAngle;
-  // 打印完整步骤：包括通过空洞到洞底
-  printExecutionSteps(startDist, startAngle, entranceDist, maxGap.centerAngle, executionTurnBackAngle, gapBottomDist);
-  
-  // 打印地图
-  printPathMap(); // 保持一次打印
-}
-
-/*
- * 分析路径并打印实际执行步骤
- */
-void printExecutionSteps(float startDist, float startAngle, float entranceDist, float entranceAngle, 
-                         float turnBackAngle, float gapBottomDist) {
-  Serial.println("\n【执行步骤】");
-  
-  // 显示倾斜角度信息
-  // 注意：tiltAngle的符号：右边高时应该是负数（需要左转），左边高时应该是正数（需要右转）
-  // 但当前代码中，如果右边高，tiltAngle可能是正数，需要检查
-  if (abs(maxGap.tiltAngle) > 0.5) {
-    Serial.print("  洞口倾斜角度: ");
-    // 如果tiltAngle > 0，说明是正数，但从计算逻辑看，右边高应该是负数
-    // 所以这里需要根据实际情况判断：如果tiltAngle > 0，可能是左边高（需要右转）
-    // 如果tiltAngle < 0，可能是右边高（需要左转）
-    if (maxGap.tiltAngle < 0) {
-      Serial.print("右边高 ");
-    } else {
-      Serial.print("左边高 ");
-    }
-    Serial.print(abs(maxGap.tiltAngle), 1);
-    Serial.println(" 度");
-  }
-  
-  // 如果角度偏差很小（小于5度），直接直行到洞口入口，然后通过空洞到洞底
-  if (abs(entranceAngle) < 5.0) {
-    float distToEntrance = entranceDist - startDist;
-    float distThroughGap = gapBottomDist - entranceDist;
-    Serial.print("  步骤1: 直行 ");
-    Serial.print(distToEntrance, 1);
-    Serial.println(" cm (到达洞口入口)");
-    Serial.print("  步骤2: 直行 ");
-    Serial.print(distThroughGap, 1);
-    Serial.println(" cm (通过空洞到洞底)");
-    return;
-  }
-  
-  // 步骤1：转向空洞中心方向
-  int stepNum = 1;
-  if (entranceAngle < 0) {
-    Serial.print("  步骤");
-    Serial.print(stepNum);
-    Serial.print(": 左转 ");
-    Serial.print(abs(entranceAngle), 1);
-    Serial.println(" 度 (朝向空洞中心)");
-  } else {
-    Serial.print("  步骤");
-    Serial.print(stepNum);
-    Serial.print(": 右转 ");
-    Serial.print(entranceAngle, 1);
-    Serial.println(" 度 (朝向空洞中心)");
-  }
-  
-  // 步骤2：直行到洞口入口
-  stepNum++;
-  float distToEntrance = entranceDist - startDist;
-  Serial.print("  步骤");
-  Serial.print(stepNum);
-  Serial.print(": 直行 ");
-  Serial.print(distToEntrance, 1);
-  Serial.println(" cm (到达洞口入口)");
-  
-  // 步骤3：转到与洞口垂直的方向（考虑倾斜角度）
-  if (abs(turnBackAngle) > 0.5) {  // 如果角度大于0.5度，需要转回
-    stepNum++;
-    if (turnBackAngle < 0) {
-      Serial.print("  步骤");
-      Serial.print(stepNum);
-      Serial.print(": 左转 ");
-      Serial.print(abs(turnBackAngle), 1);
-      Serial.print(" 度 (转到与洞口垂直");
-      if (abs(maxGap.tiltAngle) > 0.5) {
-        Serial.print("，考虑倾斜");
-      }
-      Serial.println(")");
-    } else {
-      Serial.print("  步骤");
-      Serial.print(stepNum);
-      Serial.print(": 右转 ");
-      Serial.print(turnBackAngle, 1);
-      Serial.print(" 度 (转到与洞口垂直");
-      if (abs(maxGap.tiltAngle) > 0.5) {
-        Serial.print("，考虑倾斜");
-      }
-      Serial.println(")");
-    }
-  }
-  
-  // 步骤4：直行通过空洞到洞底
-  stepNum++;
-  float distThroughGap = gapBottomDist - entranceDist;
-  Serial.print("  步骤");
-  Serial.print(stepNum);
-  Serial.print(": 直行 ");
-  Serial.print(distThroughGap, 1);
-  Serial.println(" cm (通过空洞到洞底)");
-  
-  Serial.println();
-}
-
-/*
  * 打印包含路径的地图
  * Serial输出文本格式（调试用）
  * Serial2输出二进制格式（专用串口）：帧头0xF5 + 数据(0x00/0x01/0x02) + 帧尾0xAF
@@ -2525,40 +1939,6 @@ void printPathMap() {
 }
 
 /*
- * 计算到达空洞前方合适位置的直行距离
- */
-float calculateForwardDistance(float angle) {
-  const float SAFE_DISTANCE = 30.0;  // 转回正前方后，希望距离洞口的安全距离（cm）
-  const float MIN_DISTANCE = 15.0;    // 最小直行距离15cm
-  const float MAX_DISTANCE = 70.0;    // 最大直行距离70cm
-  
-  // 计算角度（弧度）
-  float angleRad = radians(abs(angle));
-  
-  // 目标：转回正前方后，距离洞口还有SAFE_DISTANCE
-  // 设直行距离为d，实际前进距离 = d * cos(angle)
-  // 需要满足：maxGap.entranceDist - d * cos(angle) >= SAFE_DISTANCE
-  // 因此：d <= (maxGap.entranceDist - SAFE_DISTANCE) / cos(angle)
-  
-  float maxAllowedDist = (maxGap.entranceDist - SAFE_DISTANCE) / cos(angleRad);
-  
-  // 如果角度很小，使用原来的70%策略（基于洞口入口距离）
-  float baseDist = maxGap.entranceDist * 0.7;
-  
-  // 取两者中的较小值，确保不会太靠近洞口
-  float forwardDist = min(maxAllowedDist, baseDist);
-  
-  // 应用最小和最大限制
-  if (forwardDist < MIN_DISTANCE) {
-    forwardDist = MIN_DISTANCE;
-  } else if (forwardDist > MAX_DISTANCE) {
-    forwardDist = MAX_DISTANCE;
-  }
-  
-  return forwardDist;
-}
-
-/*
  * 导航到空洞方向（初始化导航状态机）
  */
 void navigateToGap() {
@@ -2584,7 +1964,6 @@ void navigateToGap() {
   }
 
   executedSegments = 0;
-  pendingBackThenStraight = false;
   macroActive = false;
 
   if (macroPlanValid) {
@@ -2814,7 +2193,6 @@ void updateNavigation() {
         if (fabs(lastSegmentTurnAngle) > 0.5f) {
           navTurnBackAngle = -lastSegmentTurnAngle;
           navState = NAV_TURN_BACK;
-          pendingBackThenStraight = true;
           requestStepPause("直行完成");
         } else {
           stopMotors();
