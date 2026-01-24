@@ -31,7 +31,4 @@ int getPlannedStepsForDisplay(char steps[][10], float values[], int maxSteps);
 bool isStepPauseActive();
 void resumeStepPause();
 
-// 打印当前点云地图（搜索模式下使用）
-void printCurrentMap();
-
 #endif

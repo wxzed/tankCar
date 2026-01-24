@@ -164,16 +164,6 @@ void updateDisplay()
   display.display();
 }
 
-bool checkCollision(int thresholdMm) {
-  int count = 0;
-  for (int i = 0; i < TOTAL_POINTS; i++) {
-    if (zValues[i] > 0 && zValues[i] < thresholdMm) {
-      count++;
-    }
-  }
-  return count >= 5; // 至少2个点确认
-}
-
 void setup() {
   Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, PATH_MAP_SERIAL_RX, PATH_MAP_SERIAL_TX);  // 初始化路径地图串口
@@ -200,10 +190,6 @@ void setup() {
 
 void loop() {
 
-  static float targetAngle = 0.0f;
-  static float targetDistance = 0.0f;
-  static long  analysisCount = 0;
-  static long  startWaitAnalysisCount = 0;
   updateDisplay();
   if (isStepPauseActive()) {
     if (keyCheck()) {
@@ -213,7 +199,6 @@ void loop() {
     handleKeyEvents();
   }
   updateNavigation();  // 更新导航状态机（持续调用电机控制函数）
-  //test();
   // if(motorDriveState == MOTOR_DRIVE_ENABLED)
   // {
   //   turnAngle(90.0f);
@@ -247,13 +232,6 @@ void loop() {
         sampleCount = 0; // 重置计数器
         
         runGapTest();    // <--- 在此处调用地图算法
-
-        // if(turnState == TURN_STOPING)
-        // {
-        //   findBestRowAndAnalyzeGaps(foundGaps, totalGaps, 10, validRow, currentMoveType);
-        //   sensorFlag = true; //数据采集+解析完成
-        // }
-        analysisCount++;
         #if DEBUG_ENABLE
         // --- 1. 打印顶部完整索引 ---
         Serial.print("    "); 
@@ -301,111 +279,4 @@ void loop() {
       #endif
     }
   }
-  
-    // if(motorDriveState == MOTOR_DRIVE_ENABLED)
-    // {
-    //   // 当处于转向任务序列中时，强制维持转向状态，忽略传感器新数据导致的状态变化
-    //   eMoveType_t logicMoveType = currentMoveType;
-    //   if (turnState == TURN_WAIT)
-    //   {
-    //      logicMoveType = MOVE_TURN_LEFT; 
-    //   }
-
-    //   if (logicMoveType == MOVE_STOP) 
-    //   {
-    //     isMoving  =  false;
-    //     isTurning =  false;
-    //     setSpeed(0, 0);         // 停车
-    //     turnState = TURN_STOPING;
-    //   } 
-    //   else if (logicMoveType == MOVE_STRAIGHT) 
-    //   {
-    //     setSpeed(LEFT_SPEED, RIGHT_SPEED);
-    //     turnState = TURN_STOPING;
-    //   } 
-
-    //   else if (logicMoveType == MOVE_TURN_LEFT || logicMoveType == MOVE_TURN_RIGHT) 
-    //   {
-    //       switch(turnState)
-    //       {
-    //         case TURN_STOPING:
-
-    //             targetAngle = angleDeg;
-    //             targetDistance = driveDistanceCm;
-    //             turnState = TURN_TURNING;
-              
-    //         break;
-
-    //         case TURN_TURNING:
-    //           turnAngle(targetAngle * 2.0f);
-    //           if(isTurning == false)
-    //           {
-    //             turnState = TURN_STRAIGHT;
-    //           }
-    //           break;
-              
-    //         case TURN_STRAIGHT:
-    //           moveDistance(targetDistance / 2.0f);
-    //           // 检查障碍物防止撞击
-    //           // if (isMoving) {
-    //           //     if (checkCollision(100)) { // 15cm内有障碍物
-    //           //         isMoving = false;
-    //           //         setSpeed(0, 0); // 紧急停车
-    //           //         turnState = TURN_RETREAT;
-    //           //         break; 
-    //           //     }
-    //           // }
-
-    //           if(isMoving == false)
-    //           {
-    //             turnState = TUNR_TURNBACK;
-    //           }
-    //           break;
-
-    //         case TURN_RETREAT:
-    //           moveDistance(-10.0f); // 后退10cm
-    //           if(isMoving == false)
-    //           {
-    //              turnState = TURN_WAIT; 
-    //              // 重新开始分析
-    //              startWaitAnalysisCount = analysisCount;
-    //              currentMoveType = MOVE_STRAIGHT; 
-    //           }
-    //           break;
-
-    //         case TUNR_TURNBACK:
-    //           turnAngle(-targetAngle * 2.0f);
-    //           if(isTurning == false)
-    //           {
-    //             turnState = TURN_LEAVE_HOLE;
-    //           }
-    //           break; 
-            
-    //         case TURN_LEAVE_HOLE:
-    //           moveDistance(10.0f);
-    //           if(isMoving == false)
-    //           {
-    //             turnState = TURN_WAIT;
-    //             startWaitAnalysisCount = analysisCount;
-    //             currentMoveType = MOVE_STRAIGHT; // 回正完成后，先置为STOP，防止使用旧的转向指令再次进入转向逻辑
-    //           }
-    //           break;
-
-    //         case TURN_WAIT:
-    //           if (analysisCount - startWaitAnalysisCount == 0)
-    //           {
-    //              turnState = TURN_STOPING; // 切换回STOPING状态，允许下一帧数据进行计算分析
-    //              analysisCount = 0;
-    //           }
-    //           break; 
-    //       }
-    //   }
-    // }
-    // else 
-    // {
-    //   setSpeed(0,0);
-    //   carState = STOPING;
-    //   isMoving = false;
-    //   isTurning = false;
-    // }
 }

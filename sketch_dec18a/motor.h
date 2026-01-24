@@ -24,7 +24,6 @@ typedef enum
 }eCarState_t;
 void mcpwm_init(void);
 void setSpeed(int leftSpeed, int rightSpeed);
-void test(void);
 void moveDistance(float distanceCm);
 void turnAngle(float angleDeg);
 extern eCarState_t carState;

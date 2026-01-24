@@ -82,34 +82,6 @@ void setSpeed(int leftSpeed, int rightSpeed)
 bool isTurning = false;
 bool isMoving = false;
 eCarState_t carState = STOPING;
-void test(void)
-{
-  static bool g_oneShotTurning = false;
-  static unsigned long g_turnStartMs = 0;
-  static const unsigned long g_turnDurationMs = 1UL; // 50度对应1s 1度对应20ms
-  if (motorDriveState == MOTOR_DRIVE_ENABLED)
-  {
-    if (!g_oneShotTurning)
-    {
-      // 初次进入启转：启动电机并记录开始时间（一次性 1000 ms）
-      setSpeed(-60, 60);
-      g_turnStartMs = millis();
-      g_oneShotTurning = true;
-    }
-    else
-    {
-      if (millis() - g_turnStartMs >= g_turnDurationMs)
-      {
-        setSpeed(0, 0);
-      }
-    }
-  }
-  else
-  {
-    setSpeed(0, 0);
-    g_oneShotTurning = false;
-  }
-}
 
 void moveDistance(float distanceCm)
 {

@@ -16,7 +16,6 @@
 #define DATA_HEADER_SIZE 4  // OK\r\n的大小
 #define POINT_DATA_SIZE  8  // 每个点的数据大小
 #define FRAME_SIZE (DATA_HEADER_SIZE + TOTAL_POINTS * POINT_DATA_SIZE)  // 一帧数据的总大小
-#define MAX_GAPS         7       // 最大空隙数量
 extern uint8_t pointCloudGrid[GRID_ROWS][TOTAL_POINTS]; // 1代表障碍物, 0代表空隙
 
 extern uint8_t frameBuffer[FRAME_SIZE];
@@ -25,46 +24,11 @@ extern bool    inSyncMode; // 用于同步数据帧
 extern bool    sensorFlag;
 extern int16_t zValues[TOTAL_POINTS];
 extern int16_t rawZBuffer[TOTAL_POINTS][FILTER_SAMPLES]; 
-extern int16_t rawXBuffer[TOTAL_POINTS][FILTER_SAMPLES];
 extern int     sampleCount;
-
-struct GapInfo {
-    int start_index; // 空隙起始点的索引
-    int width;       // 空隙的宽度（点的数量）
-};
-extern GapInfo foundGaps[10]; 
-extern int totalGaps;
-extern int validRow;
-typedef enum
-{
-    MOVE_STOP = 0,
-    MOVE_STRAIGHT,
-    MOVE_TURN_LEFT,
-    MOVE_TURN_RIGHT
-}eMoveType_t;
-typedef enum
-{
-    TURN_STRAIGHT = 0,
-    TURN_TURNING,
-    TUNR_TURNBACK,
-    TURN_WAIT,
-    TURN_STOPING,
-    TURN_LEAVE_HOLE,
-    TURN_RETREAT
-}eTurnState_t;
-extern eTurnState_t turnState;
-extern eMoveType_t  currentMoveType;
-void calculateGapsForRow(int row, GapInfo* gapsOutput, int& gapCountOutput, int maxGaps);
-void findBestRowAndAnalyzeGaps(GapInfo* gapsOutput, int& gapCountOutput, int maxGaps, int& validRowIndex,eMoveType_t &moveType);
 
 int16_t calculateAverage(int16_t *values, int count);
 int16_t calculateTrimmedFilter(int16_t *values, int count);
 void parsePointData(uint8_t* pointData,int16_t* zValue); 
-
-
-extern float angleDeg;
-extern float driveDistanceCm;
-
 
 #endif
 
