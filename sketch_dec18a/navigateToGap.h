@@ -22,6 +22,7 @@ void runGapTest();
 void updateNavigation();  // 更新导航状态（需要在主循环中持续调用）
 NavigationState getNavigationState();  // 获取当前导航状态
 SearchReason getSearchReason();  // 获取当前搜索原因
+bool isDeadendReturnActive(); // 死胡同后退后不执行新路径提示
 
 // 获取下一步执行步骤信息（用于屏幕显示）
 void getNextStepInfo(char* step1, float* value1, char* step2, float* value2, char* step3, float* value3);

@@ -74,6 +74,13 @@ void updateDisplay()
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   
+  if (isDeadendReturnActive()) {
+    display.setTextSize(2);
+    display.print("RETURN");
+    display.display();
+    return;
+  }
+
   // 检查是否在搜索模式
   NavigationState navState = getNavigationState();
   if (navState == NAV_SEARCHING) {
