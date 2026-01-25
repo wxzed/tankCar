@@ -83,6 +83,7 @@ static const int MIN_FORWARD_ROWS_FOR_KEEP = 10; // 至少可达10行(约50cm)�
 static const float BLOCKED_TURN_ANGLE_DEG = 45.0f; // 阻塞转向角度
 static const float DEADEND_TURN_ANGLE_DEG = 45.0f; // 死胡同转向角度
 static const float DEADEND_BACK_CM = 20.0f; // 死胡同时先后退距离
+static const float DEADEND_REPLAN_STRAIGHT_CM = 30.0f; // 死胡同重规划后直行阈值
 static const float MAX_INITIAL_STRAIGHT_CM = 40.0f; // 仅在“纯直行开局”时限制
 
 // 搜索模式相关变量
@@ -95,6 +96,7 @@ static bool searchSingleTurn = false; // 只转一次（90度）后结束搜索
 static bool deadendBackActive = false; // 死胡同后退中
 static float singleTurnTargetDeg = 0.0f; // 单次转向角度
 static bool deadendTurnOnly = false; // 死胡同后退完成后只转向不直行
+static bool pendingDeadendReplan = false; // 死胡同后退完成，等待重规划判断
 
 // 搜索原因（枚举定义在头文件中）
 static SearchReason currentSearchReason = SEARCH_NO_REASON; // 当前搜索原因
@@ -517,6 +519,19 @@ void runGapTest()  {
     }
   } else {
     macroPlanValid = false;
+  }
+
+  if (pendingDeadendReplan) {
+    pendingDeadendReplan = false;
+    if (macroPlanValid && fabs(macroTurnDeg) <= 0.5f &&
+        macroStraight1Cm >= DEADEND_REPLAN_STRAIGHT_CM) {
+      deadendTurnOnly = true;
+      navTurnAngle = -DEADEND_TURN_ANGLE_DEG;
+      navState = NAV_TURN_TO_GAP;
+      setCurrentAction("left", DEADEND_TURN_ANGLE_DEG);
+      Serial.println("【前方死胡同】直行过长，转向45度后再规划");
+      return;
+    }
   }
   
   // 执行导航：电机启用才执行，否则仅输出规划结果
@@ -2216,11 +2231,10 @@ static void handleMoveCompleted() {
   delayAfterAction();
   if (deadendBackActive) {
     deadendBackActive = false;
-    deadendTurnOnly = true;
-    navTurnAngle = -DEADEND_TURN_ANGLE_DEG;
-    navState = NAV_TURN_TO_GAP;
-    setCurrentAction("left", DEADEND_TURN_ANGLE_DEG);
-    Serial.println("【前方死胡同】后退完成，执行转向45度");
+    navState = NAV_IDLE;
+    requestReplan("死胡同后退完成，重新规划");
+    setCurrentAction("", 0.0f);
+    pendingDeadendReplan = true;
     return;
   }
   if (pendingTurnBackStraight) {

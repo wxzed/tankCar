@@ -9,7 +9,7 @@
 #define START_POINT     16       // 起始点16
 #define END_POINT       47       // 结束点48 
 #define TOTAL_POINTS    (END_POINT - START_POINT + 1)  // 总点数
-#define FILTER_SAMPLES  3        // 采集3次
+#define FILTER_SAMPLES  1        // 采集1次
 #define ROW_INTERVAL_CM 5        // 行间隔，每行代表的实际距离增量 单位 cm
 #define GRID_ROWS       20       // 网格行数，根据最大距离和行间隔计算得出
 // 接收的数据参数
