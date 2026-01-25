@@ -41,7 +41,7 @@ float navTurnAngle = 0.0;
 float navTurnBackAngle = 0.0;
 static NavigationState lastLoggedNavState = NAV_IDLE; // 调试：记录上一次打印的状态
 static bool pathCompleted = false; // 标记路径是否刚完成，需要在重新检测前延时
-static const unsigned long REPLAN_DELAY_MS = 200; // 重新规划前的短暂停顿
+static const unsigned long REPLAN_DELAY_MS = 0; // 重新规划前的短暂停顿
 
 // 路径规划结果
 static bool pathAvailable = false;
@@ -75,7 +75,7 @@ static float macroTurnDeg = 0.0f;
 static const bool REPLAN_AFTER_TURNBACK = true; // 回正后立即重规划，不再执行最后直行
 static char currentAction[10] = ""; // 当前执行动作：left/right/line
 static float currentActionValue = 0.0f;
-static const unsigned long ACTION_STEP_DELAY_MS = 250; // 每步完成后停顿，便于观察
+static const unsigned long ACTION_STEP_DELAY_MS = 0; // 每步完成后停顿，便于观察
 static const float FRONT_BLOCK_DISTANCE_CM = 50.0f; // 前方阻塞检测距离
 static const unsigned long BLOCKED_TURN_COOLDOWN_MS = 1200; // 避免频繁触发转向
 static unsigned long lastBlockedTurnMs = 0;
@@ -284,6 +284,7 @@ static bool buildMacroPathDirect(int startRow, int startCol,
                                  int& endR, int& endC);
 static bool detectCollisionNarrow();
 static bool detectCollisionWide();
+static bool detectCollisionStop();
 static bool isFrontFullyBlocked(float distanceCm);
 static void enterSearchMode(SearchReason reason, const char* logMessage, bool singleTurn, float singleTurnAngleDeg);
 static void handleTurnToGap();
@@ -2041,7 +2042,7 @@ void navigateToGap() {
   // 如果之前正在导航，先停止当前动作
   if (navState != NAV_IDLE && navState != NAV_MOVE_THROUGH) {
     stopMotors();
-    delay(100);
+    // 不再强制等待，避免走走停停
   }
   
   if (!pathAvailable || waypointCount < 2) {
@@ -2099,6 +2100,13 @@ static bool detectCollisionWide() {
   const int COLLISION_THRESHOLD_MM = 150; // 15cm = 150mm
   int centerStart = TOTAL_POINTS / 4;  // 从1/4处开始
   int centerEnd = TOTAL_POINTS * 3 / 4 - 1;  // 到3/4处结束（中间一半的列）
+  return checkCollisionRisk(COLLISION_THRESHOLD_MM, centerStart, centerEnd);
+}
+
+static bool detectCollisionStop() {
+  const int COLLISION_THRESHOLD_MM = 180; // 18cm 刹停阈值
+  int centerStart = TOTAL_POINTS / 3;            // 中间 1/3
+  int centerEnd   = TOTAL_POINTS * 2 / 3 - 1;
   return checkCollisionRisk(COLLISION_THRESHOLD_MM, centerStart, centerEnd);
 }
 
@@ -2174,6 +2182,15 @@ static void handleMoveToEntrance() {
   // 宏路径执行中不动态重规划，避免中途被打断
   if (!macroActive && tryReplanAndSwitchPath(false)) {
     Serial.println("【动态重规划】使用新路径，重新执行");
+    return;
+  }
+
+  if (!deadendBackActive && navForwardDist > 0.5f && detectCollisionStop()) {
+    stopMotors();
+    navState = NAV_IDLE;
+    requestReplan("近距离障碍，刹停重规划");
+    setCurrentAction("", 0.0f);
+    wasMoving = false;
     return;
   }
 
@@ -2398,12 +2415,11 @@ static void handleSearch() {
   float angleStep = searchSingleTurn ? singleTurnTargetDeg : searchAngleStep;
   float maxAngle = searchSingleTurn ? singleTurnTargetDeg : maxSearchAngle;
 
-  if (abs(searchTotalAngle) >= maxAngle) {
-    Serial.println("【搜索模式】已搜索一圈，重新开始搜索...");
-    searchStep = 0;
-    searchTotalAngle = 0.0;
-    delay(500);
-  }
+    if (abs(searchTotalAngle) >= maxAngle) {
+      Serial.println("【搜索模式】已搜索一圈，重新开始搜索...");
+      searchStep = 0;
+      searchTotalAngle = 0.0;
+    }
 
   if (searchStep % 2 == 0) {
     static bool rotationStarted = false;
@@ -2452,7 +2468,6 @@ static void handleSearch() {
       searchStep++;
       rotationStarted = false;
       Serial.println("【搜索模式】转向完成，等待检测...");
-      delay(300);
     }
   } else {
     static unsigned long detectionStartTime = 0;
@@ -2592,6 +2607,8 @@ static void requestReplan(const char* reason) {
   pendingReplanLog = true;
   Serial.print("【重规划请求】");
   Serial.println(reason);
+  Serial.println("【重规划】刷新路径地图 -> Serial/Serial2");
+  printPathMap();
 }
 
 static void setCurrentAction(const char* action, float value) {
